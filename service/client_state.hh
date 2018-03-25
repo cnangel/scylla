@@ -41,6 +41,7 @@
 
 #pragma once
 
+#include "auth/service.hh"
 #include "exceptions/exceptions.hh"
 #include "unimplemented.hh"
 #include "timestamp.hh"
@@ -52,16 +53,25 @@
 #include "tracing/tracing.hh"
 #include "tracing/trace_state.hh"
 
+namespace auth {
+class resource;
+}
+
 namespace service {
 
 /**
  * State related to a client connection.
  */
 class client_state {
+public:
+    enum class auth_state : uint8_t {
+        UNINITIALIZED, AUTHENTICATION, READY
+    };
+
 private:
     sstring _keyspace;
     tracing::trace_state_ptr _trace_state_ptr;
-    lw_shared_ptr<utils::UUID> _tracing_session_id;
+    unsigned _cpu_of_origin;
 #if 0
     private static final Logger logger = LoggerFactory.getLogger(ClientState.class);
     public static final SemanticVersion DEFAULT_CQL_VERSION = org.apache.cassandra.cql3.QueryProcessor.CQL_VERSION;
@@ -86,10 +96,16 @@ private:
 #endif
     ::shared_ptr<auth::authenticated_user> _user;
 
+    // Only considered in the "request copy"
+    bool _user_is_dirty = false;
+
+    auth_state _auth_state = auth_state::UNINITIALIZED;
+
     // isInternal is used to mark ClientState as used by some internal component
     // that should have an ability to modify system keyspace.
     bool _is_internal;
     bool _is_thrift;
+    bool _is_request_copy = false;
 
     // The biggest timestamp that was returned by getTimestamp/assigned to a query
     api::timestamp_type _last_timestamp_micros = 0;
@@ -99,19 +115,19 @@ private:
     // Address of a client
     socket_address _remote_address;
 
+    // Only populated for external client state.
+    auth::service* _auth_service{nullptr};
+
+    // Only set for "request copy"
+    stdx::optional<api::timestamp_type> _request_ts;
+
 public:
     struct internal_tag {};
     struct external_tag {};
+    struct request_copy_tag {};
 
     void create_tracing_session(tracing::trace_type type, tracing::trace_state_props_set props) {
         _trace_state_ptr = tracing::tracing::get_local_tracing_instance().create_session(type, props);
-        // store a session ID separately because its lifetime is not always
-        // coupled with the trace_state because the trace_state may already be
-        // destroyed when we need a session ID for a response to a client (e.g.
-        // in case of errors).
-        if (_trace_state_ptr) {
-            _tracing_session_id = make_lw_shared<utils::UUID>(_trace_state_ptr->session_id());
-        }
     }
 
     tracing::trace_state_ptr& get_trace_state() {
@@ -122,11 +138,34 @@ public:
         return _trace_state_ptr;
     }
 
-    client_state(external_tag, const socket_address& remote_address = socket_address(), bool thrift = false)
-            : _is_internal(false)
+    auth_state get_auth_state() const noexcept {
+        return _auth_state;
+    }
+
+    void set_auth_state(auth_state new_state) noexcept {
+        _auth_state = new_state;
+    }
+
+    /// \brief A cross-shard copy-constructor.
+    /// Copies everything that may be copied on the remote shard (e.g. _user is out since it's a shared_ptr).
+    /// The created copy of the original client state that may be safely used in the specific request handling flow.
+    /// The given timestamp is going to be used in the context of the corresponding query instead of being generated.
+    /// The caller must ensure that the given timestamps are monotonic in the context of a specific client/connection.
+    ///
+    /// \note May not be called if the Tracing state has already been initialized.
+    ///
+    /// \param request_copy_tag
+    /// \param orig The client_state that should be copied.
+    /// \param ts A timestamp to use during the request handling
+    client_state(request_copy_tag, const client_state& orig, api::timestamp_type ts);
+
+    client_state(external_tag, auth::service& auth_service, const socket_address& remote_address = socket_address(), bool thrift = false)
+            : _cpu_of_origin(engine().cpu_id())
+            , _is_internal(false)
             , _is_thrift(thrift)
-            , _remote_address(remote_address) {
-        if (!auth::authenticator::get().require_authentication()) {
+            , _remote_address(remote_address)
+            , _auth_service(&auth_service) {
+        if (!auth_service.underlying_authenticator().require_authentication()) {
             _user = ::make_shared<auth::authenticated_user>();
         }
     }
@@ -135,12 +174,28 @@ public:
         return gms::inet_address(_remote_address);
     }
 
-    client_state(internal_tag) : _keyspace("system"), _is_internal(true), _is_thrift(false) {}
+    client_state(internal_tag)
+            : _keyspace("system")
+            , _cpu_of_origin(engine().cpu_id())
+            , _is_internal(true)
+            , _is_thrift(false)
+    {}
+
+    ///
+    /// `nullptr` for internal instances.
+    ///
+    const auth::service* get_auth_service() const {
+        return _auth_service;
+    }
 
     void merge(const client_state& other);
 
     bool is_thrift() const {
         return _is_thrift;
+    }
+
+    bool is_dirty() const noexcept {
+        return _dirty;
     }
 
     bool is_internal() const {
@@ -155,13 +210,15 @@ public:
     }
 
     /**
+     * The `auth::service` should be non-`nullptr` for native protocol users.
+     *
      * @return a ClientState object for external clients (thrift/native protocol users).
      */
-    static client_state for_external_calls() {
-        return client_state(external_tag());
+    static client_state for_external_calls(auth::service& ser) {
+        return client_state(external_tag(), ser);
     }
-    static client_state for_external_thrift_calls() {
-        return client_state(external_tag(), socket_address(), true);
+    static client_state for_external_thrift_calls(auth::service& ser) {
+        return client_state(external_tag(), ser, socket_address(), true);
     }
 
     /**
@@ -169,6 +226,10 @@ public:
      * in the sequence seen, even if multiple updates happen in the same millisecond.
      */
     api::timestamp_type get_timestamp() {
+        if (_request_ts) {
+            return *_request_ts;
+        }
+
         auto current = api::new_timestamp();
         auto last = _last_timestamp_micros;
         auto result = last >= current ? last + 1 : current;
@@ -199,11 +260,25 @@ public:
     }
 #endif
 
-    const sstring& get_raw_keyspace() const {
+    const sstring& get_raw_keyspace() const noexcept {
+        return _keyspace;
+    }
+
+    sstring& get_raw_keyspace() noexcept {
         return _keyspace;
     }
 
 public:
+    /// \brief Get a local copy of the orig._auth_service.
+    /// \param orig The original client_state.
+    /// \return The pointer to the local auth_service instance or nullptr if orig._auth_serice == nullptr.
+    auth::service* local_auth_service_copy(const service::client_state& orig) const;
+
+    /// \brief Get a local copy of the orig._user.
+    /// \param orig The original client_state.
+    /// \return The shared_ptr created on a local shard pointing to the auth::authenticated_user object equal to the *orig._user.
+    ::shared_ptr<auth::authenticated_user> local_user_copy(const service::client_state& orig) const;
+
     void set_keyspace(seastar::sharded<database>& db, sstring keyspace) {
         // Skip keyspace validation for non-authenticated users. Apparently, some client libraries
         // call set_keyspace() before calling login(), and we have to handle that.
@@ -212,6 +287,10 @@ public:
         }
         _keyspace = keyspace;
         _dirty = true;
+    }
+
+    void set_raw_keyspace(sstring new_keyspace) noexcept {
+        _keyspace = std::move(new_keyspace);
     }
 
     const sstring& get_keyspace() const {
@@ -237,10 +316,16 @@ public:
     future<> has_schema_access(const schema& s, auth::permission p) const;
 
 private:
-    future<> has_access(const sstring&, auth::permission, auth::data_resource) const;
-    future<bool> check_has_permission(auth::permission, auth::data_resource) const;
+    future<> has_access(const sstring&, auth::permission, const auth::resource&) const;
+
 public:
-    future<> ensure_has_permission(auth::permission, auth::data_resource) const;
+    future<bool> check_has_permission(auth::permission, const auth::resource&) const;
+    future<> ensure_has_permission(auth::permission, const auth::resource&) const;
+
+    /**
+     * Returns an exceptional future with \ref exceptions::invalid_request_exception if the resource does not exist.
+     */
+    future<> ensure_exists(const auth::resource&) const;
 
     void validate_login() const;
     void ensure_not_anonymous() const; // unauthorized_exception on error
@@ -261,6 +346,10 @@ public:
 
     ::shared_ptr<auth::authenticated_user> user() const {
         return _user;
+    }
+
+    bool user_is_dirty() const noexcept {
+        return _user_is_dirty;
     }
 
 #if 0
@@ -288,3 +377,4 @@ public:
 };
 
 }
+

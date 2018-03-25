@@ -33,6 +33,8 @@
 #include <seastar/core/align.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/backtrace.hh>
 
 #include "utils/logalloc.hh"
 #include "log.hh"
@@ -71,6 +73,136 @@ migrate_fn_type::unregister_migrator(uint32_t index) {
 
 namespace logalloc {
 
+#ifdef DEBUG_LSA_SANITIZER
+
+class region_sanitizer {
+    struct allocation {
+        size_t size;
+        saved_backtrace backtrace;
+    };
+private:
+    static logging::logger logger;
+
+    bool _broken = false;
+    std::unordered_map<const void*, allocation> _allocations;
+private:
+    template<typename Function>
+    void run_and_handle_errors(Function&& fn) noexcept {
+        if (_broken) {
+            return;
+        }
+        try {
+            fn();
+        } catch (...) {
+            logger.error("Internal error, disabling the sanitizer: {}", std::current_exception());
+            _broken = true;
+            _allocations.clear();
+        }
+    }
+private:
+    void on_error() { abort(); }
+public:
+    void on_region_destruction() noexcept {
+        run_and_handle_errors([&] {
+            if (_allocations.empty()) {
+                return;
+            }
+            for (auto [ptr, alloc] : _allocations) {
+                logger.error("Leaked {} byte object at {} allocated from:\n{}",
+                             alloc.size, ptr, alloc.backtrace);
+            }
+            on_error();
+        });
+    }
+    void on_allocation(const void* ptr, size_t size) noexcept {
+        run_and_handle_errors([&] {
+            auto [ it, success ] = _allocations.emplace(ptr, allocation { size, current_backtrace() });
+            if (!success) {
+                logger.error("Attempting to allocate an {} byte object at an already occupied address {}:\n{}\n"
+                             "Previous allocation of {} bytes:\n{}",
+                             ptr, size, current_backtrace(), it->second.size, it->second.backtrace);
+                on_error();
+            }
+        });
+    }
+    void on_free(const void* ptr, size_t size) noexcept {
+        run_and_handle_errors([&] {
+            auto it = _allocations.find(ptr);
+            if (it == _allocations.end()) {
+                logger.error("Attempting to free an object at {} (size: {}) that does not exist\n{}",
+                             ptr, size, current_backtrace());
+                on_error();
+            }
+            if (it->second.size != size) {
+                logger.error("Mismatch between allocation and deallocation size of object at {}: {} vs. {}:\n{}\n"
+                             "Allocated at:\n{}",
+                             ptr, it->second.size, size, current_backtrace(), it->second.backtrace);
+                on_error();
+            }
+            _allocations.erase(it);
+        });
+    }
+    void on_migrate(const void* src, size_t size, const void* dst) noexcept {
+        run_and_handle_errors([&] {
+            auto it_src = _allocations.find(src);
+            if (it_src == _allocations.end()) {
+                logger.error("Attempting to migrate an object at {} (size: {}) that does not exist",
+                             src, size);
+                on_error();
+            }
+            if (it_src->second.size != size) {
+                logger.error("Mismatch between allocation and migration size of object at {}: {} vs. {}\n"
+                             "Allocated at:\n{}",
+                             src, it_src->second.size, size, it_src->second.backtrace);
+                on_error();
+            }
+            auto [ it_dst, success ] = _allocations.emplace(dst, std::move(it_src->second));
+            if (!success) {
+                logger.error("Attempting to migrate an {} byte object to an already occupied address {}:\n"
+                             "Migrated object allocated from:\n{}\n"
+                             "Previous allocation of {} bytes at the destination:\n{}",
+                             size, dst, it_src->second.backtrace, it_dst->second.size, it_dst->second.backtrace);
+                on_error();
+            }
+            _allocations.erase(it_src);
+        });
+    }
+    void merge(region_sanitizer& other) noexcept {
+        run_and_handle_errors([&] {
+            _broken = other._broken;
+            if (_broken) {
+                _allocations.clear();
+            } else {
+                _allocations.merge(other._allocations);
+                if (!other._allocations.empty()) {
+                    for (auto [ptr, o_alloc] : other._allocations) {
+                        auto& alloc = _allocations.at(ptr);
+                        logger.error("Conflicting allocations at address {} in merged regions\n"
+                                     "{} bytes allocated from:\n{}\n"
+                                     "{} bytes allocated from:\n{}",
+                                     ptr, alloc.size, alloc.backtrace, o_alloc.size, o_alloc.backtrace);
+                    }
+                    on_error();
+                }
+            }
+        });
+    }
+};
+
+logging::logger region_sanitizer::logger("lsa-sanitizer");
+
+#else
+
+struct region_sanitizer {
+    void on_region_destruction() noexcept { }
+    void on_allocation(const void*, size_t) noexcept { }
+    void on_free(const void* ptr, size_t size) noexcept { }
+    void on_migrate(const void*, size_t, const void*) noexcept { }
+    void merge(region_sanitizer&) noexcept { }
+};
+
+#endif
+
 struct segment;
 
 static logging::logger llogger("lsa");
@@ -107,7 +239,7 @@ public:
     impl();
     ~impl();
     void register_region(region::impl*);
-    void unregister_region(region::impl*);
+    void unregister_region(region::impl*) noexcept;
     size_t reclaim(size_t bytes);
     reactor::idle_cpu_handler_result compact_on_idle(reactor::work_waiting_on_reactor check_for_work);
     size_t compact_and_evict(size_t bytes);
@@ -116,6 +248,7 @@ public:
     void reclaim_all_free_segments();
     occupancy_stats region_occupancy();
     occupancy_stats occupancy();
+    size_t non_lsa_used_space();
     void set_reclamation_step(size_t step_in_segments) { _reclamation_step = step_in_segments; }
     size_t reclamation_step() const { return _reclamation_step; }
     void enable_abort_on_bad_alloc() { _abort_on_bad_alloc = true; }
@@ -150,6 +283,10 @@ occupancy_stats tracker::region_occupancy() {
 
 occupancy_stats tracker::occupancy() {
     return _impl->occupancy();
+}
+
+size_t tracker::non_lsa_used_space() const {
+    return _impl->non_lsa_used_space();
 }
 
 void tracker::full_compaction() {
@@ -290,7 +427,7 @@ static inline bool can_allocate_more_memory(size_t size)
 class segment_zone : public bi::set_base_hook<>, public bi::slist_base_hook<> {
     struct free_segment : public bi::slist_base_hook<> { };
 
-    static constexpr size_t maximum_size = 256;
+    static constexpr size_t maximum_size = max_zone_segments;
     static constexpr size_t minimum_size = 16;
     static thread_local size_t next_attempt_size;
 
@@ -574,10 +711,8 @@ size_t segment_pool::reclaim_segments(size_t target) {
     bi::slist<segment_zone> zones_to_remove;
     for (auto& zone : _all_zones | boost::adaptors::reversed) {
         if (zone.empty()) {
-            if (reclaimed_segments < target || !zone.free_segment_count()) {
-                reclaimed_segments += zone.free_segment_count();
-                zones_to_remove.push_front(zone);
-            }
+            reclaimed_segments += zone.free_segment_count();
+            zones_to_remove.push_front(zone);
         } else if (zone.free_segment_count()) {
             _free_segments_in_zones += zone.free_segment_count();
             zone.rebuild_free_segments_list();
@@ -936,7 +1071,7 @@ segment::occupancy() const {
 // Per-segment metadata is kept in a separate array, managed by segment_pool
 // object.
 //
-class region_impl : public allocation_strategy {
+class region_impl final : public basic_region_impl {
     // Serialized object descriptor format:
     //  byte0 byte1 ... byte[n-1]
     //  bit0-bit5: ULEB64 significand
@@ -1075,8 +1210,8 @@ private:
     // occupancy. We could actually just present this as a scalar as well and never use occupancies,
     // but consistency is good.
     size_t _evictable_space = 0;
-    bool _reclaiming_enabled = true;
     bool _evictable = false;
+    region_sanitizer _sanitizer;
     uint64_t _id;
     eviction_fn _eviction_fn;
 
@@ -1187,6 +1322,7 @@ private:
         for_each_live(seg, [this] (const object_descriptor* desc, void* obj) {
             auto size = desc->live_size(obj);
             auto dst = alloc_small(desc->migrator(), size, desc->alignment());
+            _sanitizer.on_migrate(obj, size, dst);
             desc->migrator()->migrate(obj, dst);
         });
 
@@ -1226,12 +1362,19 @@ public:
     {
         _preferred_max_contiguous_allocation = max_managed_object_size;
         tracker_instance._impl->register_region(this);
-        if (group) {
-            group->add(this);
+        try {
+            if (group) {
+                group->add(this);
+            }
+        } catch (...) {
+            tracker_instance._impl->unregister_region(this);
+            throw;
         }
     }
 
     virtual ~region_impl() {
+        _sanitizer.on_region_destruction();
+
         tracker_instance._impl->unregister_region(this);
 
         while (!_segment_descs.empty()) {
@@ -1296,6 +1439,7 @@ public:
 
     virtual void* alloc(allocation_strategy::migrate_fn migrator, size_t size, size_t alignment) override {
         compaction_lock _(*this);
+        memory::on_alloc_point();
         if (size > max_managed_object_size) {
             auto ptr = standard_allocator().alloc(migrator, size, alignment);
             // This isn't very acurrate, the correct free_space value would be
@@ -1310,7 +1454,9 @@ public:
             shard_segment_pool.update_non_lsa_memory_in_use(allocated_size);
             return ptr;
         } else {
-            return alloc_small(migrator, (segment::size_type) size, alignment);
+            auto ptr = alloc_small(migrator, (segment::size_type) size, alignment);
+            _sanitizer.on_allocation(ptr, size);
+            return ptr;
         }
     }
 
@@ -1329,6 +1475,8 @@ public:
             standard_allocator().free(obj, size);
             return;
         }
+
+        _sanitizer.on_free(obj, size);
 
         segment_descriptor& seg_desc = shard_segment_pool.descriptor(seg);
 
@@ -1373,6 +1521,11 @@ public:
     // to refer to this region.
     // Doesn't invalidate references to allocated objects.
     void merge(region_impl& other) noexcept {
+        // degroup_temporarily allocates via binomial_heap::push(), which should not
+        // fail, because we have a matching deallocation before that and we don't
+        // allocate between them.
+        memory::disable_failure_guard dfg;
+
         compaction_lock dct1(*this);
         compaction_lock dct2(other);
         degroup_temporarily dgt1(this);
@@ -1406,6 +1559,9 @@ public:
         // Make sure both regions will notice a future increment
         // to the reclaim counter
         _invalidate_counter = std::max(_invalidate_counter, other._invalidate_counter);
+
+        _sanitizer.merge(other._sanitizer);
+        other._sanitizer = { };
     }
 
     // Returns occupancy of the sparsest compactible segment.
@@ -1454,7 +1610,9 @@ public:
             desc.encode(dpos, pos - old_pos);
             if (desc.is_live()) {
                 offset += pos - old_pos;
-                offset += desc.live_size(pos);
+                auto size = desc.live_size(pos);
+                offset += size;
+                _sanitizer.on_migrate(pos, size, dpos);
                 desc.migrator()->migrate(const_cast<char*>(pos), dpos);
             } else {
                 offset += desc.dead_size();
@@ -1486,14 +1644,6 @@ public:
 
     uint64_t id() const {
         return _id;
-    }
-
-    void set_reclaiming_enabled(bool enabled) {
-        _reclaiming_enabled = enabled;
-    }
-
-    bool reclaiming_enabled() const {
-        return _reclaiming_enabled;
     }
 
     // Returns true if this pool is evictable, so that evict_some() can be called.
@@ -1587,14 +1737,21 @@ region::region(region_group& group)
         : _impl(make_shared<impl>(this, &group)) {
 }
 
+region_impl& region::get_impl() {
+    return *static_cast<region_impl*>(_impl.get());
+}
+const region_impl& region::get_impl() const {
+    return *static_cast<const region_impl*>(_impl.get());
+}
+
 region::region(region&& other) {
     this->_impl = std::move(other._impl);
-    this->_impl->_region = this;
+    get_impl()._region = this;
 }
 
 region& region::operator=(region&& other) {
     this->_impl = std::move(other._impl);
-    this->_impl->_region = this;
+    get_impl()._region = this;
     return *this;
 }
 
@@ -1602,53 +1759,37 @@ region::~region() {
 }
 
 occupancy_stats region::occupancy() const {
-    return _impl->occupancy();
+    return get_impl().occupancy();
 }
 
 region_group* region::group() {
-    return _impl->group();
+    return get_impl().group();
 }
 
 void region::merge(region& other) noexcept {
     if (_impl != other._impl) {
-        _impl->merge(*other._impl);
+        get_impl().merge(other.get_impl());
         other._impl = _impl;
     }
 }
 
 void region::full_compaction() {
-    _impl->full_compaction();
+    get_impl().full_compaction();
 }
 
 memory::reclaiming_result region::evict_some() {
-    if (_impl->is_evictable()) {
-        return _impl->evict_some();
+    if (get_impl().is_evictable()) {
+        return get_impl().evict_some();
     }
     return memory::reclaiming_result::reclaimed_nothing;
 }
 
 void region::make_evictable(eviction_fn fn) {
-    _impl->make_evictable(std::move(fn));
+    get_impl().make_evictable(std::move(fn));
 }
 
 const eviction_fn& region::evictor() const {
-    return _impl->evictor();
-}
-
-allocation_strategy& region::allocator() {
-    return *_impl;
-}
-
-const allocation_strategy& region::allocator() const {
-    return *_impl;
-}
-
-void region::set_reclaiming_enabled(bool compactible) {
-    _impl->set_reclaiming_enabled(compactible);
-}
-
-bool region::reclaiming_enabled() const {
-    return _impl->reclaiming_enabled();
+    return get_impl().evictor();
 }
 
 std::ostream& operator<<(std::ostream& out, const occupancy_stats& stats) {
@@ -1673,6 +1814,11 @@ occupancy_stats tracker::impl::occupancy() {
         occ += occupancy_stats(s, s);
     }
     return occ;
+}
+
+size_t tracker::impl::non_lsa_used_space() {
+    auto free_space_in_zones = shard_segment_pool.free_segments_in_zones() * segment_size;
+    return memory::stats().allocated_memory() - region_occupancy().total_space() - free_space_in_zones;
 }
 
 void tracker::impl::reclaim_all_free_segments()
@@ -1982,10 +2128,10 @@ void tracker::impl::register_region(region::impl* r) {
     llogger.debug("Registered region @{} with id={}", r, r->id());
 }
 
-void tracker::impl::unregister_region(region::impl* r) {
+void tracker::impl::unregister_region(region::impl* r) noexcept {
     reclaiming_lock _(*this);
     llogger.debug("Unregistering region, id={}", r->id());
-    _regions.erase(std::remove(_regions.begin(), _regions.end(), r));
+    _regions.erase(std::remove(_regions.begin(), _regions.end(), r), _regions.end());
 }
 
 tracker::impl::impl() {
@@ -2007,11 +2153,8 @@ tracker::impl::impl() {
         sm::make_gauge("large_objects_total_space_bytes", [this] { return shard_segment_pool.non_lsa_memory_in_use(); },
                        sm::description("Holds a current size of allocated non-LSA memory.")),
 
-        sm::make_gauge("non_lsa_used_space_bytes",
-            [this] {
-                auto free_space_in_zones = shard_segment_pool.free_segments_in_zones() * segment_size;
-                return memory::stats().allocated_memory() - region_occupancy().total_space() - free_space_in_zones;
-            }, sm::description("Holds a current amount of used non-LSA memory.")),
+        sm::make_gauge("non_lsa_used_space_bytes", [this] { return non_lsa_used_space(); },
+                       sm::description("Holds a current amount of used non-LSA memory.")),
 
         sm::make_gauge("free_space_in_zones", [this] { return shard_segment_pool.free_segments_in_zones() * segment_size; },
                        sm::description("Holds a current amount of free memory in zones.")),
@@ -2170,16 +2313,16 @@ allocating_section::guard::~guard() {
 
 #ifndef DEFAULT_ALLOCATOR
 
-void allocating_section::guard::enter(allocating_section& self) {
-    shard_segment_pool.set_emergency_reserve_max(std::max(self._lsa_reserve, _prev));
+void allocating_section::reserve() {
+    shard_segment_pool.set_emergency_reserve_max(std::max(_lsa_reserve, _minimum_lsa_emergency_reserve));
     shard_segment_pool.refill_emergency_reserve();
 
     while (true) {
         size_t free = memory::stats().free_memory();
-        if (free >= self._std_reserve) {
+        if (free >= _std_reserve) {
             break;
         }
-        if (!tracker_instance.reclaim(self._std_reserve - free)) {
+        if (!tracker_instance.reclaim(_std_reserve - free)) {
             throw std::bad_alloc();
         }
     }
@@ -2187,7 +2330,8 @@ void allocating_section::guard::enter(allocating_section& self) {
     shard_segment_pool.clear_allocation_failure_flag();
 }
 
-void allocating_section::on_alloc_failure() {
+void allocating_section::on_alloc_failure(logalloc::region& r) {
+    r.allocator().invalidate_references();
     if (shard_segment_pool.allocation_failure_flag()) {
         _lsa_reserve *= 2; // FIXME: decay?
         llogger.debug("LSA allocation failure, increasing reserve in section {} to {} segments", this, _lsa_reserve);
@@ -2195,14 +2339,15 @@ void allocating_section::on_alloc_failure() {
         _std_reserve *= 2; // FIXME: decay?
         llogger.debug("Standard allocator failure, increasing head-room in section {} to {} [B]", this, _std_reserve);
     }
+    reserve();
 }
 
 #else
 
-void allocating_section::guard::enter(allocating_section& self) {
+void allocating_section::reserve() {
 }
 
-void allocating_section::on_alloc_failure() {
+void allocating_section::on_alloc_failure(logalloc::region&) {
     throw std::bad_alloc();
 }
 

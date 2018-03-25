@@ -22,6 +22,7 @@
 #include "repair.hh"
 #include "range_split.hh"
 
+#include "atomic_cell_hash.hh"
 #include "streaming/stream_plan.hh"
 #include "streaming/stream_state.hh"
 #include "gms/inet_address.hh"
@@ -36,6 +37,8 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include <boost/range/algorithm.hpp>
+#include <boost/range/algorithm_ext.hpp>
+#include <boost/range/adaptor/map.hpp>
 
 #include <cryptopp/sha.h>
 #include <seastar/core/gate.hh>
@@ -347,7 +350,7 @@ private:
     // Used to allow shutting down repairs in progress, and waiting for them.
     seastar::gate _gate;
     // Set when the repair service is being shutdown
-    std::atomic_bool _shutdown alignas(64);
+    std::atomic_bool _shutdown alignas(seastar::cache_line_size);
     // Map repair id into repair_info. The vector has smp::count elements, each
     // element will be accessed by only one shard.
     std::vector<std::unordered_map<int, lw_shared_ptr<repair_info>>> _repairs;
@@ -410,6 +413,13 @@ public:
         }
         return {};
     }
+    std::vector<int> get_active() const {
+        std::vector<int> res;
+        boost::push_back(res, _status | boost::adaptors::filtered([] (auto& x) {
+            return x.second == repair_status::RUNNING;
+        }) | boost::adaptors::map_keys);
+        return res;
+    }
     size_t nr_running_repair_jobs() {
         size_t count = 0;
         if (engine().cpu_id() != 0) {
@@ -444,6 +454,9 @@ class sha256_hasher {
     CryptoPP::SHA256 hash{};
 public:
     void update(const char* ptr, size_t length) {
+        // In Crypto++ v6, the `byte` typedef has been moved to CryptoPP:: namespace
+        // We bring the namespace in to make the same code work for both 5.x and 6.x versions
+        using namespace CryptoPP;
         static_assert(sizeof(char) == sizeof(byte), "Assuming lengths will be the same");
         hash.Update(reinterpret_cast<const byte*>(ptr), length * sizeof(byte));
     }
@@ -455,34 +468,158 @@ public:
     }
 };
 
-future<partition_checksum> partition_checksum::compute_legacy(streamed_mutation m)
-{
-    return mutation_from_streamed_mutation(std::move(m)).then([] (auto mopt) {
-        assert(mopt);
-        std::array<uint8_t, 32> digest;
-        sha256_hasher h;
-        feed_hash(h, *mopt);
-        h.finalize(digest);
-        return partition_checksum(digest);
-    });
-}
+class partition_hasher {
+    const schema& _schema;
+    sha256_hasher _hasher;
+    partition_checksum _checksum;
 
-future<partition_checksum> partition_checksum::compute_streamed(streamed_mutation m)
+    bound_view::compare _cmp;
+    range_tombstone_list _rt_list;
+    bool _inside_range_tombstone = false;
+private:
+    void consume_cell(const column_definition& col, const atomic_cell_or_collection& cell) {
+        feed_hash(_hasher, col.name());
+        feed_hash(_hasher, col.type->name());
+        feed_hash(_hasher, cell, col);
+    }
+
+    void consume_range_tombstone_start(const range_tombstone& rt) {
+        feed_hash(_hasher, rt.start, _schema);
+        feed_hash(_hasher, rt.start_kind);
+        feed_hash(_hasher, rt.tomb);
+    }
+
+    void consume_range_tombstone_end(const range_tombstone& rt) {
+        feed_hash(_hasher, rt.end, _schema);
+        feed_hash(_hasher, rt.end_kind);
+    }
+
+    void pop_rt_front() {
+        auto& rt = *_rt_list.tombstones().begin();
+        _rt_list.tombstones().erase(_rt_list.begin());
+        current_deleter<range_tombstone>()(&rt);
+    }
+
+    void consume_range_tombstones_until(const clustering_row& cr) {
+        while (!_rt_list.empty()) {
+            auto it = _rt_list.begin();
+            if (_inside_range_tombstone) {
+                if (_cmp(it->end_bound(), cr.key())) {
+                    consume_range_tombstone_end(*it);
+                    _inside_range_tombstone = false;
+                    pop_rt_front();
+                } else {
+                    break;
+                }
+            } else {
+                if (_cmp(it->start_bound(), cr.key())) {
+                    consume_range_tombstone_start(*it);
+                    _inside_range_tombstone = true;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    void consume_range_tombstones_until_end() {
+        if (_inside_range_tombstone) {
+            consume_range_tombstone_end(*_rt_list.begin());
+            pop_rt_front();
+        }
+        for (auto&& rt : _rt_list) {
+            consume_range_tombstone_start(rt);
+            consume_range_tombstone_end(rt);
+        }
+        _rt_list.clear();
+        _inside_range_tombstone = false;
+    }
+public:
+    explicit partition_hasher(const schema& s)
+        : _schema(s), _cmp(s), _rt_list(s) { }
+
+    void consume_new_partition(const dht::decorated_key& dk) {
+        feed_hash(_hasher, dk.key(), _schema);
+    }
+
+    stop_iteration consume(tombstone t) {
+        feed_hash(_hasher, t);
+        return stop_iteration::no;
+    }
+
+    stop_iteration consume(const static_row& sr) {
+        sr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& cell) {
+            auto&& col = _schema.static_column_at(id);
+            consume_cell(col, cell);
+        });
+        return stop_iteration::no;
+    }
+
+    stop_iteration consume(const clustering_row& cr) {
+        consume_range_tombstones_until(cr);
+
+        feed_hash(_hasher, cr.key(), _schema);
+        feed_hash(_hasher, cr.tomb());
+        feed_hash(_hasher, cr.marker());
+        cr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& cell) {
+            auto&& col = _schema.regular_column_at(id);
+            consume_cell(col, cell);
+        });
+        return stop_iteration::no;
+    }
+
+    stop_iteration consume(range_tombstone&& rt) {
+        _rt_list.apply(_schema, std::move(rt));
+        return stop_iteration::no;
+    }
+
+    stop_iteration consume_end_of_partition() {
+        consume_range_tombstones_until_end();
+
+        std::array<uint8_t, 32> digest;
+        _hasher.finalize(digest);
+        _hasher = { };
+
+        _checksum.add(partition_checksum(digest));
+        return stop_iteration::no;
+    }
+
+    partition_checksum consume_end_of_stream() {
+        return std::move(_checksum);
+    }
+};
+
+future<partition_checksum> partition_checksum::compute_legacy(flat_mutation_reader mr)
 {
-    auto& s = *m.schema();
-    auto h = make_lw_shared<sha256_hasher>();
-    m.key().feed_hash(*h, s);
-    return do_with(std::move(m), [&s, h] (auto& sm) mutable {
-        mutation_hasher<sha256_hasher> mh(s, *h);
-        return consume(sm, std::move(mh)).then([ h ] {
-            std::array<uint8_t, 32> digest;
-            h->finalize(digest);
-            return partition_checksum(digest);
+    auto s = mr.schema();
+    return do_with(std::move(mr),
+                   partition_checksum(), [] (auto& reader, auto& checksum) {
+        return repeat([&reader, &checksum] () {
+            return read_mutation_from_flat_mutation_reader(reader).then([&checksum] (auto mopt) {
+                if (!mopt) {
+                    return stop_iteration::yes;
+                }
+                std::array<uint8_t, 32> digest;
+                sha256_hasher h;
+                feed_hash(h, *mopt);
+                h.finalize(digest);
+                checksum.add(partition_checksum(digest));
+                return stop_iteration::no;
+            });
+        }).then([&checksum] {
+            return checksum;
         });
     });
 }
 
-future<partition_checksum> partition_checksum::compute(streamed_mutation m, repair_checksum hash_version)
+future<partition_checksum> partition_checksum::compute_streamed(flat_mutation_reader m)
+{
+    return do_with(std::move(m), [] (auto& m) {
+        return m.consume(partition_hasher(*m.schema()));
+    });
+}
+
+future<partition_checksum> partition_checksum::compute(flat_mutation_reader m, repair_checksum hash_version)
 {
     switch (hash_version) {
     case repair_checksum::legacy: return compute_legacy(std::move(m));
@@ -543,23 +680,7 @@ static future<partition_checksum> checksum_range_shard(database &db,
         const dht::partition_range_vector& prs, repair_checksum hash_version) {
     auto& cf = db.find_column_family(keyspace_name, cf_name);
     auto reader = cf.make_streaming_reader(cf.schema(), prs);
-    return do_with(std::move(reader), partition_checksum(),
-        [hash_version] (auto& reader, auto& checksum) {
-        return repeat([&reader, &checksum, hash_version] () {
-            return reader().then([&checksum, hash_version] (auto mopt) {
-                if (mopt) {
-                    return partition_checksum::compute(std::move(*mopt), hash_version).then([&checksum] (auto pc) {
-                        checksum.add(pc);
-                        return stop_iteration::no;
-                    });
-                } else {
-                    return make_ready_future<stop_iteration>(stop_iteration::yes);
-                }
-            });
-        }).then([&checksum] {
-            return checksum;
-        });
-    });
+    return partition_checksum::compute(std::move(reader), hash_version);
 }
 
 // It is counter-productive to allow a large number of range checksum
@@ -1234,6 +1355,12 @@ future<int> repair_start(seastar::sharded<database>& db, sstring keyspace,
         std::unordered_map<sstring, sstring> options) {
     return db.invoke_on(0, [&db, keyspace = std::move(keyspace), options = std::move(options)] (database& localdb) {
         return do_repair_start(db, std::move(keyspace), std::move(options));
+    });
+}
+
+future<std::vector<int>> get_active_repairs(seastar::sharded<database>& db) {
+    return db.invoke_on(0, [] (database& localdb) {
+        return repair_tracker.get_active();
     });
 }
 

@@ -28,6 +28,7 @@
 #include "http/httpd.hh"
 #include "api/api_init.hh"
 #include "db/config.hh"
+#include "db/extensions.hh"
 #include "db/legacy_schema_migrator.hh"
 #include "service/storage_service.hh"
 #include "service/migration_manager.hh"
@@ -36,6 +37,7 @@
 #include "db/system_keyspace.hh"
 #include "db/batchlog_manager.hh"
 #include "db/commitlog/commitlog.hh"
+#include "db/hints/manager.hh"
 #include "db/commitlog/commitlog_replayer.hh"
 #include "utils/runtime.hh"
 #include "utils/file_lock.hh"
@@ -59,22 +61,11 @@
 #include "sstables/compaction_manager.hh"
 #include "sstables/sstables.hh"
 
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
 seastar::metrics::metric_groups app_metrics;
 
 using namespace std::chrono_literals;
 
 namespace bpo = boost::program_options;
-
-static std::vector<std::reference_wrapper<configurable>>& configurables() {
-    static std::vector<std::reference_wrapper<configurable>> configurables;
-    return configurables;
-}
-
-void configurable::register_configurable(configurable & c) {
-    configurables().emplace_back(std::ref(c));
-}
 
 template<typename K, typename V, typename... Args, typename K2, typename V2 = V>
 V get_or_default(const std::unordered_map<K, V, Args...>& ss, const K2& key, const V2& def = V()) {
@@ -101,7 +92,13 @@ read_config(bpo::variables_map& opts, db::config& cfg) {
         file = relative_conf_dir("scylla.yaml").string();
     }
     return check_direct_io_support(file).then([file, &cfg] {
-        return cfg.read_from_file(file);
+        return cfg.read_from_file(file, [](auto & opt, auto & msg, auto status) {
+            auto level = log_level::warn;
+            if (status.value_or(db::config::value_status::Invalid) != db::config::value_status::Invalid) {
+                level = log_level::error;
+            }
+            startlog.log(level, "{} : {}", msg, opt);
+        });
     }).handle_exception([file](auto ep) {
         startlog.error("Could not read configuration file {}: {}", file, ep);
         return make_exception_future<>(ep);
@@ -181,10 +178,12 @@ verify_rlimit(bool developer_mode) {
 }
 
 static bool cpu_sanity() {
+#if defined(__x86_64__) || defined(__i386__)
     if (!__builtin_cpu_supports("sse4.2")) {
         std::cerr << "Scylla requires a processor with SSE 4.2 support\n";
         return false;
     }
+#endif
     return true;
 }
 
@@ -255,6 +254,29 @@ public:
     future<> stop() { return make_ready_future<>(); }
 };
 
+static stdx::optional<std::vector<sstring>> parse_hinted_handoff_enabled(sstring opt) {
+    using namespace boost::algorithm;
+
+    if (boost::iequals(opt, "false") || opt == "0") {
+        return stdx::nullopt;
+    } else if (boost::iequals(opt, "true") || opt == "1") {
+        return std::vector<sstring>{};
+    }
+
+    std::vector<sstring> dcs;
+    split(dcs, opt, is_any_of(","));
+
+    std::for_each(dcs.begin(), dcs.end(), [] (sstring& dc) {
+        trim(dc);
+        if (dc.empty()) {
+            startlog.error("hinted_handoff_enabled: DC name may not be an empty string");
+            throw bad_configuration_error();
+        }
+    });
+
+    return dcs;
+}
+
 int main(int ac, char** av) {
   int return_value = 0;
   try {
@@ -269,19 +291,24 @@ int main(int ac, char** av) {
     app_cfg.default_task_quota = 500us;
     app_template app(std::move(app_cfg));
 
-    auto cfg = make_lw_shared<db::config>();
-    bool help_version = false;
+    auto ext = std::make_shared<db::extensions>();
+    auto cfg = make_lw_shared<db::config>(ext);
     auto init = app.get_options_description().add_options();
 
-    cfg->add_options(init);
-    for (configurable& c : configurables()) {
-        c.append_options(init);
+    // If --version is requested, print it out and exit immediately to avoid
+    // Seastar-specific warnings that may occur when running the app
+    init("version", bpo::bool_switch(), "print version number and exit");
+    bpo::variables_map vm;
+    bpo::store(bpo::command_line_parser(ac, av).options(app.get_options_description()).allow_unregistered().run(), vm);
+    if (vm["version"].as<bool>()) {
+        print("%s\n", scylla_version());
+        return 0;
     }
 
-    init // TODO : default, always read?
-        ("options-file", bpo::value<sstring>(), "configuration file (i.e. <SCYLLA_HOME>/conf/scylla.yaml)")
-        ("version", bpo::bool_switch(&help_version), "print version number and exit")
-        ;
+    // TODO : default, always read?
+    init("options-file", bpo::value<sstring>(), "configuration file (i.e. <SCYLLA_HOME>/conf/scylla.yaml)");
+    cfg->add_options(init);
+    configurable::append_all(init);
 
     distributed<database> db;
     seastar::sharded<service::cache_hitrate_calculator> cf_cache_hitrate_calculator;
@@ -295,11 +322,7 @@ int main(int ac, char** av) {
     directories dirs;
 
     return app.run_deprecated(ac, av, [&] {
-        if (help_version) {
-            print("%s\n", scylla_version());
-            engine().exit(0);
-            return make_ready_future<>();
-        }
+
         print("Scylla version %s starting ...\n", scylla_version());
         auto&& opts = app.configuration();
 
@@ -317,11 +340,9 @@ int main(int ac, char** av) {
 
         tcp_syncookies_sanity();
 
-        return seastar::async([cfg, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs, &pctx, &prometheus_server, &return_value, &cf_cache_hitrate_calculator] {
+        return seastar::async([cfg, ext, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs, &pctx, &prometheus_server, &return_value, &cf_cache_hitrate_calculator] {
             read_config(opts, *cfg).get();
-            for (configurable& c : configurables()) {
-                c.initialize(opts).get();
-            }
+            configurable::init_all(opts, *cfg, *ext).get();
 
             logging::apply_settings(cfg->logging_settings(opts));
 
@@ -348,6 +369,7 @@ int main(int ac, char** av) {
             sstring api_address = cfg->api_address() != "" ? cfg->api_address() : rpc_address;
             sstring broadcast_address = cfg->broadcast_address();
             sstring broadcast_rpc_address = cfg->broadcast_rpc_address();
+            stdx::optional<std::vector<sstring>> hinted_handoff_enabled = cfg->experimental() ? parse_hinted_handoff_enabled(cfg->hinted_handoff_enabled()) : stdx::nullopt;
             auto prom_addr = seastar::net::dns::get_host_by_name(cfg->prometheus_address()).get0();
             supervisor::notify("starting prometheus API server");
             uint16_t pport = cfg->prometheus_port();
@@ -355,6 +377,9 @@ int main(int ac, char** av) {
                 pctx.metric_help = "Scylla server statistics";
                 pctx.prefix = cfg->prometheus_prefix();
                 prometheus_server.start("prometheus").get();
+                engine().at_exit([&prometheus_server] {
+                    return prometheus_server.stop();
+                });
                 prometheus::start(prometheus_server, pctx);
                 prometheus_server.listen(ipv4_addr{prom_addr.addr_list.front(), pport}).handle_exception([pport, &cfg] (auto ep) {
                     startlog.error("Could not start Prometheus API server on {}:{}: {}", cfg->prometheus_address(), pport, ep);
@@ -430,16 +455,26 @@ int main(int ac, char** av) {
             api::set_server_init(ctx).get();
             ctx.http_server.listen(ipv4_addr{ip, api_port}).get();
             startlog.info("Scylla API server listening on {}:{} ...", api_address, api_port);
+            static sharded<auth::service> auth_service;
             supervisor::notify("initializing storage service");
-            init_storage_service(db);
+            init_storage_service(db, auth_service);
             supervisor::notify("starting per-shard database core");
             // Note: changed from using a move here, because we want the config object intact.
-            db.start(std::ref(*cfg)).get();
+            database_config dbcfg;
+            auto make_sched_group = [&] (sstring name, unsigned shares) {
+                if (cfg->cpu_scheduler()) {
+                    return seastar::create_scheduling_group(name, shares).get0();
+                } else {
+                    return seastar::scheduling_group();
+                }
+            };
+            dbcfg.compaction_scheduling_group = make_sched_group("compaction", 1000);
+            dbcfg.streaming_scheduling_group = make_sched_group("streaming", 200);
+            dbcfg.statement_scheduling_group = make_sched_group("statement", 1000);
+            dbcfg.memtable_scheduling_group = make_sched_group("memtable", 1000);
+            dbcfg.memtable_to_cache_scheduling_group = make_sched_group("memtable_to_cache", 200);
+            db.start(std::ref(*cfg), dbcfg).get();
             engine().at_exit([&db, &return_value] {
-                // A shared sstable must be compacted by all shards before it can be deleted.
-                // Since we're stoping, that's not going to happen.  Cancel those pending
-                // deletions to let anyone waiting on them to continue.
-                sstables::cancel_atomic_deletions();
                 // #293 - do not stop anything - not even db (for real)
                 //return db.stop();
                 // call stop on each db instance, but leave the shareded<database> pointers alive.
@@ -456,11 +491,26 @@ int main(int ac, char** av) {
             dirs.touch_and_lock(db.local().get_config().data_file_directories()).get();
             supervisor::notify("creating commitlog directory");
             dirs.touch_and_lock(db.local().get_config().commitlog_directory()).get();
-            supervisor::notify("verifying data and commitlog directories");
             std::unordered_set<sstring> directories;
             directories.insert(db.local().get_config().data_file_directories().cbegin(),
                     db.local().get_config().data_file_directories().cend());
             directories.insert(db.local().get_config().commitlog_directory());
+
+            if (hinted_handoff_enabled) {
+                supervisor::notify("creating hints directories");
+                using namespace boost::filesystem;
+
+                path hints_base_dir(db.local().get_config().hints_directory());
+                dirs.touch_and_lock(db.local().get_config().hints_directory()).get();
+                directories.insert(db.local().get_config().hints_directory());
+                for (unsigned i = 0; i < smp::count; ++i) {
+                    sstring shard_dir((hints_base_dir / seastar::to_sstring(i).c_str()).native());
+                    dirs.touch_and_lock(shard_dir).get();
+                    directories.insert(std::move(shard_dir));
+                }
+            }
+
+            supervisor::notify("verifying directories");
             parallel_for_each(directories, [&db] (sstring pathname) {
                 return disk_sanity(pathname, db.local().get_config().developer_mode());
             }).get();
@@ -492,7 +542,7 @@ int main(int ac, char** av) {
             auto prio = get_or_default(ssl_opts, "priority_string", sstring());
             auto clauth = is_true(get_or_default(ssl_opts, "require_client_auth", "false"));
             if (cluster_name.empty()) {
-                cluster_name = "ScyllaDB Cluster";
+                cluster_name = "Test Cluster";
                 startlog.warn("Using default cluster name is not recommended. Using a unique cluster name will reduce the chance of adding nodes to the wrong cluster by mistake");
             }
             init_ms_fd_gossiper(listen_address
@@ -510,9 +560,8 @@ int main(int ac, char** av) {
                     , cluster_name
                     , phi
                     , cfg->listen_on_broadcast_address());
-            supervisor::notify("starting messaging service");
             supervisor::notify("starting storage proxy");
-            proxy.start(std::ref(db)).get();
+            proxy.start(std::ref(db), hinted_handoff_enabled).get();
             // #293 - do not stop anything
             // engine().at_exit([&proxy] { return proxy.stop(); });
             supervisor::notify("starting migration manager");
@@ -553,7 +602,7 @@ int main(int ac, char** av) {
                 if (!paths.empty()) {
                     supervisor::notify("replaying commit log");
                     auto rp = db::commitlog_replayer::create_replayer(qp).get0();
-                    rp.recover(paths).get();
+                    rp.recover(paths, db::commitlog::descriptor::FILENAME_PREFIX).get();
                     supervisor::notify("replaying commit log - flushing memtables");
                     db.invoke_on_all([] (database& db) {
                         return db.flush_all_memtables();
@@ -581,7 +630,6 @@ int main(int ac, char** av) {
                     cf.trigger_compaction();
                 }
             }).get();
-            api::set_server_storage_service(ctx).get();
             api::set_server_gossip(ctx).get();
             api::set_server_snitch(ctx).get();
             api::set_server_storage_proxy(ctx).get();
@@ -599,6 +647,7 @@ int main(int ac, char** av) {
             supervisor::notify("starting streaming service");
             streaming::stream_session::init_streaming_service(db).get();
             api::set_server_stream_manager(ctx).get();
+            supervisor::notify("starting messaging service");
             // Start handling REPAIR_CHECKSUM_RANGE messages
             netw::get_messaging_service().invoke_on_all([&db] (auto& ms) {
                 ms.register_repair_checksum_range([&db] (sstring keyspace, sstring cf, dht::token_range range, rpc::optional<repair_checksum> hash_version) {
@@ -611,9 +660,10 @@ int main(int ac, char** av) {
             }).get();
             supervisor::notify("starting storage service", true);
             auto& ss = service::get_local_storage_service();
-            ss.init_server().get();
+            ss.init_messaging_service_part().get();
             api::set_server_messaging_service(ctx).get();
             api::set_server_storage_service(ctx).get();
+            ss.init_server_without_the_messaging_service_part().get();
             supervisor::notify("starting batchlog manager");
             db::get_batchlog_manager().invoke_on_all([] (db::batchlog_manager& b) {
                 return b.start();
@@ -629,8 +679,16 @@ int main(int ac, char** av) {
             cf_cache_hitrate_calculator.start(std::ref(db), std::ref(cf_cache_hitrate_calculator)).get();
             engine().at_exit([&cf_cache_hitrate_calculator] { return cf_cache_hitrate_calculator.stop(); });
             cf_cache_hitrate_calculator.local().run_on(engine().cpu_id());
+            api::set_server_cache(ctx);
             gms::get_local_gossiper().wait_for_gossip_to_settle().get();
             api::set_server_gossip_settle(ctx).get();
+
+            if (hinted_handoff_enabled) {
+                supervisor::notify("starting hinted handoff manager");
+                db::hints::manager::rebalance().get();
+                proxy.invoke_on_all([] (service::storage_proxy& local_proxy) { local_proxy.start_hints_manager(gms::get_local_gossiper().shared_from_this()); }).get();
+            }
+
             supervisor::notify("starting native transport");
             service::get_local_storage_service().start_native_transport().get();
             if (start_thrift) {

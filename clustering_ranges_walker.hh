@@ -25,7 +25,7 @@
 
 #include "schema.hh"
 #include "query-request.hh"
-#include "streamed_mutation.hh"
+#include "mutation_fragment.hh"
 
 // Utility for in-order checking of overlap with position ranges.
 class clustering_ranges_walker {
@@ -70,7 +70,7 @@ public:
     {
         if (!with_static_row) {
             if (_current == _end) {
-                _current_start = _current_end = position_in_partition_view::after_all_clustered_rows();
+                _current_start = position_in_partition_view::before_all_clustered_rows();
             } else {
                 _current_start = position_in_partition_view::for_range_start(*_current);
                 _current_end = position_in_partition_view::for_range_end(*_current);
@@ -169,14 +169,14 @@ public:
     bool contains_tombstone(position_in_partition_view start, position_in_partition_view end) const {
         position_in_partition::less_compare less(_schema);
 
-        if (_trim && less(end, *_trim)) {
+        if (_trim && !less(*_trim, end)) {
             return false;
         }
 
         auto i = _current;
         while (i != _end) {
             auto range_start = position_in_partition_view::for_range_start(*i);
-            if (less(end, range_start)) {
+            if (!less(range_start, end)) {
                 return false;
             }
             auto range_end = position_in_partition_view::for_range_end(*i);

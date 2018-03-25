@@ -48,6 +48,7 @@
 #include "core/stream.hh"
 #include "replay_position.hh"
 #include "commitlog_entry.hh"
+#include "db/timeout_clock.hh"
 
 namespace seastar { class file; }
 
@@ -95,8 +96,6 @@ class rp_handle;
  */
 class commitlog {
 public:
-    using timeout_clock = lowres_clock;
-
     class segment_manager;
     class segment;
 
@@ -113,6 +112,7 @@ public:
         config(const db::config&);
 
         sstring commit_log_location;
+        sstring metrics_category_name;
         uint64_t commitlog_total_space_in_mb = 0;
         uint64_t commitlog_segment_size_in_mb = 32;
         uint64_t commitlog_sync_period_in_ms = 10 * 1000; //TODO: verify default!
@@ -125,11 +125,12 @@ public:
         uint64_t max_active_flushes = 0;
 
         sync_mode mode = sync_mode::PERIODIC;
+        std::string fname_prefix = descriptor::FILENAME_PREFIX;
     };
 
     struct descriptor {
     private:
-        descriptor(std::pair<uint64_t, uint32_t> p);
+        descriptor(std::pair<uint64_t, uint32_t> p, const std::string& fname_prefix);
     public:
         static const std::string SEPARATOR;
         static const std::string FILENAME_PREFIX;
@@ -137,15 +138,16 @@ public:
 
         descriptor(descriptor&&) = default;
         descriptor(const descriptor&) = default;
-        descriptor(segment_id_type i, uint32_t v = 1);
-        descriptor(replay_position p);
-        descriptor(sstring filename);
+        descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = 1);
+        descriptor(replay_position p, const std::string& fname_prefix = FILENAME_PREFIX);
+        descriptor(const sstring& filename, const std::string& fname_prefix = FILENAME_PREFIX);
 
         sstring filename() const;
         operator replay_position() const;
 
         const segment_id_type id;
         const uint32_t ver;
+        const std::string filename_prefix = FILENAME_PREFIX;
     };
 
     commitlog(commitlog&&) noexcept;
@@ -180,7 +182,7 @@ public:
      *
      * @param mutation_func a function that writes 'size' bytes to the log, representing the mutation.
      */
-    future<rp_handle> add(const cf_id_type& id, size_t size, timeout_clock::time_point timeout, serializer_func mutation_func);
+    future<rp_handle> add(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, serializer_func mutation_func);
 
     /**
      * Template version of add.
@@ -188,7 +190,7 @@ public:
      * @param mu an invokable op that generates the serialized data. (Of size bytes)
      */
     template<typename _MutationOp>
-    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, timeout_clock::time_point timeout, _MutationOp&& mu) {
+    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, _MutationOp&& mu) {
         return add(id, size, timeout, [mu = std::forward<_MutationOp>(mu)](output& out) {
             mu(out);
         });
@@ -200,7 +202,7 @@ public:
      */
     template<typename _MutationOp>
     future<rp_handle> add_mutation(const cf_id_type& id, size_t size, _MutationOp&& mu) {
-        return add_mutation(id, size, timeout_clock::time_point::max(), std::forward<_MutationOp>(mu));
+        return add_mutation(id, size, db::timeout_clock::time_point::max(), std::forward<_MutationOp>(mu));
     }
 
     /**
@@ -208,7 +210,7 @@ public:
      * Resolves with timed_out_error when timeout is reached.
      * @param entry_writer a writer responsible for writing the entry
      */
-    future<rp_handle> add_entry(const cf_id_type& id, const commitlog_entry_writer& entry_writer, timeout_clock::time_point timeout);
+    future<rp_handle> add_entry(const cf_id_type& id, const commitlog_entry_writer& entry_writer, db::timeout_clock::time_point timeout);
 
     /**
      * Modifies the per-CF dirty cursors of any commit log segments for the column family according to the position

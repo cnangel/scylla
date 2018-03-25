@@ -232,6 +232,16 @@ future<> gossiper::handle_syn_msg(msg_addr from, gossip_digest_syn syn_msg) {
     return this->ms().send_gossip_digest_ack(from, std::move(ack_msg));
 }
 
+class gossiper::msg_proc_guard {
+public:
+    msg_proc_guard(gossiper& g)
+                    : _ptr(&(++g._msg_processing), [](uint64_t * p) { if (p) { --(*p); } })
+    {}
+    msg_proc_guard(msg_proc_guard&& m) = default;
+private:
+    std::unique_ptr<uint64_t, void(*)(uint64_t*)> _ptr;
+};
+
 // Depends on
 // - failure_detector
 // - on_change callbacks, e.g., storage_service -> access db system_table
@@ -246,6 +256,8 @@ future<> gossiper::handle_ack_msg(msg_addr id, gossip_digest_ack ack_msg) {
         return make_ready_future<>();
     }
 
+    msg_proc_guard mp(*this);
+
     auto g_digest_list = ack_msg.get_gossip_digest_list();
     auto& ep_state_map = ack_msg.get_endpoint_state_map();
 
@@ -256,7 +268,9 @@ future<> gossiper::handle_ack_msg(msg_addr id, gossip_digest_ack ack_msg) {
         f = this->apply_state_locally(std::move(ep_state_map));
     }
 
-    return f.then([id, g_digest_list = std::move(g_digest_list), this] {
+    assert(_msg_processing > 0);
+
+    return f.then([id, g_digest_list = std::move(g_digest_list), mp = std::move(mp), this] {
         if (this->is_in_shadow_round()) {
             this->finish_shadow_round();
             // don't bother doing anything else, we have what we came for
@@ -291,10 +305,13 @@ future<> gossiper::handle_ack2_msg(gossip_digest_ack2 msg) {
     if (!is_enabled()) {
         return make_ready_future<>();
     }
+
+    msg_proc_guard mp(*this);
+
     auto& remote_ep_state_map = msg.get_endpoint_state_map();
     /* Notify the Failure Detector */
     notify_failure_detector(remote_ep_state_map);
-    return apply_state_locally(std::move(remote_ep_state_map));
+    return apply_state_locally(std::move(remote_ep_state_map)).finally([mp = std::move(mp)] {});
 }
 
 future<> gossiper::handle_echo_msg() {
@@ -313,7 +330,7 @@ future<> gossiper::handle_shutdown_msg(inet_address from) {
     });
 }
 
-void gossiper::init_messaging_service_handler() {
+void gossiper::init_messaging_service_handler(bind_messaging_port do_bind) {
     if (_ms_registered) {
         return;
     }
@@ -361,7 +378,9 @@ void gossiper::init_messaging_service_handler() {
     });
 
     // Start listening messaging_service after gossip message handlers are registered
-    ms().start_listen();
+    if (do_bind) {
+        ms().start_listen();
+    }
 }
 
 void gossiper::uninit_messaging_service_handler() {
@@ -689,7 +708,7 @@ void gossiper::run() {
                     _shadow_unreachable_endpoints = _unreachable_endpoints;
                 }
 
-                _the_gossiper.invoke_on_all([this, live_endpoint_changed, unreachable_endpoint_changed] (gossiper& local_gossiper) {
+                _the_gossiper.invoke_on_all([this, live_endpoint_changed, unreachable_endpoint_changed, es = endpoint_state_map] (gossiper& local_gossiper) {
                     // Don't copy gossiper(CPU0) maps into themselves!
                     if (engine().cpu_id() != 0) {
                         if (live_endpoint_changed) {
@@ -698,6 +717,10 @@ void gossiper::run() {
 
                         if (unreachable_endpoint_changed) {
                             local_gossiper._unreachable_endpoints = _shadow_unreachable_endpoints;
+                        }
+
+                        for (auto&& e : es) {
+                            local_gossiper.endpoint_state_map[e.first].set_alive(e.second.is_alive());
                         }
                     }
                 }).get();
@@ -748,9 +771,13 @@ void gossiper::unregister_(shared_ptr<i_endpoint_state_change_subscriber> subscr
 
 std::set<inet_address> gossiper::get_live_members() {
     std::set<inet_address> live_members(_live_endpoints.begin(), _live_endpoints.end());
-    if (!live_members.count(get_broadcast_address())) {
-        live_members.insert(get_broadcast_address());
+    auto myip = get_broadcast_address();
+    logger.debug("live_members before={}", live_members);
+    live_members.insert(myip);
+    if (is_shutdown(myip)) {
+        live_members.erase(myip);
     }
+    logger.debug("live_members after={}", live_members);
     return live_members;
 }
 
@@ -828,6 +855,7 @@ int gossiper::get_max_endpoint_state_version(endpoint_state state) {
 
 // Runs inside seastar::async context
 void gossiper::evict_from_membership(inet_address endpoint) {
+    auto permit = lock_endpoint(endpoint).get0();
     _unreachable_endpoints.erase(endpoint);
     container().invoke_on_all([endpoint] (auto& g) {
         g.endpoint_state_map.erase(endpoint);
@@ -1159,7 +1187,11 @@ utils::UUID gossiper::get_host_id(inet_address endpoint) {
     if (!uses_host_id(endpoint)) {
         throw std::runtime_error(sprint("Host %s does not use new-style tokens!", endpoint));
     }
-    return utils::UUID(get_application_state_ptr(endpoint, application_state::HOST_ID)->value);
+    auto app_state = get_application_state_ptr(endpoint, application_state::HOST_ID);
+    if (!app_state) {
+        throw std::runtime_error(sprint("Host %s does not have HOST_ID application_state", endpoint));
+    }
+    return utils::UUID(app_state->value);
 }
 
 std::experimental::optional<endpoint_state> gossiper::get_state_for_version_bigger_than(inet_address for_endpoint, int version) {
@@ -1527,15 +1559,15 @@ void gossiper::examine_gossiper(std::vector<gossip_digest>& g_digest_list,
     }
 }
 
-future<> gossiper::start_gossiping(int generation_number) {
-    return start_gossiping(generation_number, std::map<application_state, versioned_value>());
+future<> gossiper::start_gossiping(int generation_number, bind_messaging_port do_bind) {
+    return start_gossiping(generation_number, std::map<application_state, versioned_value>(), do_bind);
 }
 
-future<> gossiper::start_gossiping(int generation_nbr, std::map<application_state, versioned_value> preload_local_states) {
+future<> gossiper::start_gossiping(int generation_nbr, std::map<application_state, versioned_value> preload_local_states, bind_messaging_port do_bind) {
     // Although gossiper runs on cpu0 only, we need to listen incoming gossip
     // message on all cpus and forard them to cpu0 to process.
-    return get_gossiper().invoke_on_all([] (gossiper& g) {
-        g.init_messaging_service_handler();
+    return get_gossiper().invoke_on_all([do_bind] (gossiper& g) {
+        g.init_messaging_service_handler(do_bind);
     }).then([this, generation_nbr, preload_local_states] {
         build_seeds_list();
         /* initialize the heartbeat state for this localEndpoint */
@@ -1585,10 +1617,10 @@ future<> gossiper::do_shadow_round() {
                 });
             }
             sleep(std::chrono::seconds(1)).get();
-            if (clk::now() > t + std::chrono::milliseconds(cfg.shadow_round_ms())) {
-                throw std::runtime_error(sprint("Unable to gossip with any seeds (ShadowRound)"));
-            }
             if (this->_in_shadow_round) {
+                if (clk::now() > t + std::chrono::milliseconds(cfg.shadow_round_ms())) {
+                    throw std::runtime_error(sprint("Unable to gossip with any seeds (ShadowRound)"));
+                }
                 logger.info("Connect seeds again ... ({} seconds passed)", std::chrono::duration_cast<std::chrono::seconds>(clk::now() - t).count());
             }
         }
@@ -1635,31 +1667,83 @@ void gossiper::add_saved_endpoint(inet_address ep) {
     logger.trace("Adding saved endpoint {} {}", ep, ep_state.get_heart_beat_state().get_generation());
 }
 
+future<> gossiper::add_local_application_state(application_state state, versioned_value value) {
+    return add_local_application_state({ {std::move(state), std::move(value)} });
+}
+
+future<> gossiper::add_local_application_state(std::initializer_list<std::pair<application_state, utils::in<versioned_value>>> args) {
+    using in_pair_type = std::pair<application_state, utils::in<versioned_value>>;
+    using out_pair_type = std::pair<application_state, versioned_value>;
+    using vector_type = std::vector<out_pair_type>;
+
+    return add_local_application_state(boost::copy_range<vector_type>(args | boost::adaptors::transformed([](const in_pair_type& p) {
+        return out_pair_type(p.first, p.second.move());
+    })));
+}
+
+
 // Depends on:
 // - before_change callbacks
 // - on_change callbacks
-future<> gossiper::add_local_application_state(application_state state, versioned_value value) {
-    return get_gossiper().invoke_on(0, [state, value = std::move(value)] (auto& gossiper) mutable {
-        return seastar::async([&gossiper, g = gossiper.shared_from_this(), state, value = std::move(value)] () mutable {
+// #2894. Similar to origin fix, but relies on non-interruptability to ensure we apply
+// values "in order".
+//
+// NOTE: having the values being actual versioned values here is sort of pointless, because
+// we overwrite the version to ensure the set is monotonic. However, it does not break anything,
+// and changing this tends to spread widely (see versioned_value::factory), so that can be its own
+// change later, if needed.
+// Retaining the slightly broken signature is also cosistent with origin. Hooray.
+//
+future<> gossiper::add_local_application_state(std::vector<std::pair<application_state, versioned_value>> states) {
+    if (states.empty()) {
+        return make_ready_future<>();
+    }
+    return container().invoke_on(0, [states = std::move(states)] (gossiper& gossiper) mutable {
+        return seastar::async([g = gossiper.shared_from_this(), states = std::move(states)]() mutable {
+            auto& gossiper = *g;
             inet_address ep_addr = gossiper.get_broadcast_address();
+            // for symmetry with other apply, use endpoint lock for our own address.
+            auto permit = gossiper.lock_endpoint(ep_addr).get0();
             auto es = gossiper.get_endpoint_state_for_endpoint_ptr(ep_addr);
             if (!es) {
-                auto err = sprint("endpoint_state_map does not contain endpoint = %s, application_state = %s, value = %s",
-                                  ep_addr, state, value);
+                auto err = sprint("endpoint_state_map does not contain endpoint = %s, application_states = %s",
+                                  ep_addr, states);
                 logger.error("{}", err);
                 throw std::runtime_error(err);
             }
+
             endpoint_state ep_state_before = *es;
-            // Fire "before change" notifications:
-            gossiper.do_before_change_notifications(ep_addr, ep_state_before, state, value);
-            // Notifications may have taken some time, so preventively raise the version
-            // of the new value, otherwise it could be ignored by the remote node
-            // if another value with a newer version was received in the meantime:
-            value = storage_service_value_factory().clone_with_higher_version(value);
-            // Add to local application state and fire "on change" notifications:
+
+            for (auto& p : states) {
+                auto& state = p.first;
+                auto& value = p.second;
+                // Fire "before change" notifications:
+                // Not explicit, but apparently we allow this to defer (inside out implicit seastar::async)
+                gossiper.do_before_change_notifications(ep_addr, ep_state_before, state, value);
+            }
+
             es = gossiper.get_endpoint_state_for_endpoint_ptr(ep_addr);
-            if (es) {
+            if (!es) {
+                return;
+            }
+
+            for (auto& p : states) {
+                auto& state = p.first;
+                auto& value = p.second;
+                // Notifications may have taken some time, so preventively raise the version
+                // of the new value, otherwise it could be ignored by the remote node
+                // if another value with a newer version was received in the meantime:
+                value = storage_service_value_factory().clone_with_higher_version(value);
+                // Add to local application state
                 es->add_application_state(state, value);
+            }
+            for (auto& p : states) {
+                auto& state = p.first;
+                auto& value = p.second;
+                // fire "on change" notifications:
+                // now we might defer again, so this could be reordered. But we've
+                // ensured the whole set of values are monotonically versioned and
+                // applied to endpoint state.
                 gossiper.replicate(ep_addr, state, value).get();
                 gossiper.do_on_change_notifications(ep_addr, state, value);
             }
@@ -1742,9 +1826,7 @@ void gossiper::goto_shadow_round() {
 }
 
 void gossiper::finish_shadow_round() {
-    if (_in_shadow_round) {
-        _in_shadow_round = false;
-    }
+    _in_shadow_round = false;
 }
 
 bool gossiper::is_in_shadow_round() const {
@@ -1849,26 +1931,26 @@ sstring gossiper::get_gossip_status(const inet_address& endpoint) const {
     return do_get_gossip_status(get_application_state_ptr(endpoint, application_state::STATUS));
 }
 
-future<> gossiper::wait_for_gossip_to_settle() {
-    return seastar::async([this] {
-        auto& cfg = service::get_local_storage_service().db().local().get_config();
-        auto force_after = cfg.skip_wait_for_gossip_to_settle();
-        if (force_after == 0) {
-            return;
-        }
-        static constexpr std::chrono::milliseconds GOSSIP_SETTLE_MIN_WAIT_MS{5000};
-        static constexpr std::chrono::milliseconds GOSSIP_SETTLE_POLL_INTERVAL_MS{1000};
-        static constexpr int32_t GOSSIP_SETTLE_POLL_SUCCESSES_REQUIRED = 3;
+future<> gossiper::wait_for_gossip(std::chrono::milliseconds initial_delay, stdx::optional<int32_t> force_after) {
+    static constexpr std::chrono::milliseconds GOSSIP_SETTLE_MIN_WAIT_MS{5000};
+    static constexpr std::chrono::milliseconds GOSSIP_SETTLE_POLL_INTERVAL_MS{1000};
+    static constexpr int32_t GOSSIP_SETTLE_POLL_SUCCESSES_REQUIRED = 3;
+
+    return seastar::async([this, initial_delay, force_after] {
         int32_t total_polls = 0;
         int32_t num_okay = 0;
         int32_t ep_size = endpoint_state_map.size();
-        logger.info("Waiting for gossip to settle before accepting client requests...");
+
+        auto delay = initial_delay;
+
         sleep(GOSSIP_SETTLE_MIN_WAIT_MS).get();
         while (num_okay < GOSSIP_SETTLE_POLL_SUCCESSES_REQUIRED) {
-            sleep(GOSSIP_SETTLE_POLL_INTERVAL_MS).get();
+            sleep(delay).get();
+            delay = GOSSIP_SETTLE_POLL_INTERVAL_MS;
+
             int32_t current_size = endpoint_state_map.size();
             total_polls++;
-            if (current_size == ep_size) {
+            if (current_size == ep_size && _msg_processing == 0) {
                 logger.debug("Gossip looks settled");
                 num_okay++;
             } else {
@@ -1876,7 +1958,7 @@ future<> gossiper::wait_for_gossip_to_settle() {
                 num_okay = 0;
             }
             ep_size = current_size;
-            if (force_after > 0 && total_polls > force_after) {
+            if (force_after && *force_after > 0 && total_polls > *force_after) {
                 logger.warn("Gossip not settled but startup forced by skip_wait_for_gossip_to_settle. Gossp total polls: {}", total_polls);
                 break;
             }
@@ -1887,6 +1969,24 @@ future<> gossiper::wait_for_gossip_to_settle() {
             logger.info("No gossip backlog; proceeding");
         }
     });
+}
+
+future<> gossiper::wait_for_gossip_to_settle() {
+    static constexpr std::chrono::milliseconds GOSSIP_SETTLE_MIN_WAIT_MS{5000};
+
+    auto& cfg = service::get_local_storage_service().db().local().get_config();
+    auto force_after = cfg.skip_wait_for_gossip_to_settle();
+    if (force_after == 0) {
+        return make_ready_future<>();
+    }
+    logger.info("Waiting for gossip to settle before accepting client requests...");
+    return wait_for_gossip(GOSSIP_SETTLE_MIN_WAIT_MS, force_after);
+}
+
+future<> gossiper::wait_for_range_setup() {
+    logger.info("Waiting for pending range setup...");
+    auto ring_delay = service::get_local_storage_service().get_ring_delay();
+    return wait_for_gossip(ring_delay);
 }
 
 bool gossiper::is_safe_for_bootstrap(inet_address endpoint) {

@@ -28,11 +28,6 @@
 #include "core/future-util.hh"
 #include "db/config.hh"
 
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
-
 using namespace db;
 
 // stock, default cassandra.yaml
@@ -826,7 +821,11 @@ inline std::basic_ostream<Args...> & operator<<(std::basic_ostream<Args...> & os
 SEASTAR_TEST_CASE(test_parse_yaml) {
     config cfg;
 
-    cfg.read_from_yaml(cassandra_conf);
+    cfg.read_from_yaml(cassandra_conf, [](auto& opt, auto& msg, auto status) {
+        if (status != config::value_status::Invalid) {
+            throw std::invalid_argument(msg + " : " + opt);
+        }
+    });
 
     BOOST_CHECK_EQUAL(cfg.cluster_name(), "Test Cluster");
     BOOST_CHECK_EQUAL(cfg.cluster_name.is_set(), true);
@@ -861,4 +860,34 @@ SEASTAR_TEST_CASE(test_parse_yaml) {
     return make_ready_future<>();
 }
 
+SEASTAR_TEST_CASE(test_parse_broken) {
+    config cfg;
 
+    bool ok = false;
+
+    // this should become an "unknown option" kind of error.
+    cfg.read_from_yaml(R"foo(bork_bnork:
+    apa
+    ko
+)foo", [&](auto& opt, auto& msg, auto status) {
+        if (!status) { // unknown
+            ok = true;
+        }
+    });
+
+    BOOST_REQUIRE(ok);
+
+    ok = false;
+
+    // this should be a value parsing error.
+    cfg.read_from_yaml(R"foo(commitlog_segment_size_in_mb: flaska
+)foo", [&](auto& opt, auto& msg, auto status) {
+        if (status && status != config::value_status::Invalid) { // option exists and is valid.
+            ok = true;
+        }
+    });
+
+    BOOST_REQUIRE(ok);
+
+    return make_ready_future<>();
+}

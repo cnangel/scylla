@@ -23,6 +23,7 @@
 
 #include <map>
 #include <memory>
+#include <iosfwd>
 #include "database_fwd.hh"
 #include "dht/i_partitioner.hh"
 #include "schema.hh"
@@ -31,6 +32,7 @@
 #include "db/commitlog/rp_set.hh"
 #include "utils/logalloc.hh"
 #include "partition_version.hh"
+#include "flat_mutation_reader.hh"
 
 class frozen_mutation;
 
@@ -59,10 +61,22 @@ public:
     partition_entry& partition() { return _pe; }
     const schema_ptr& schema() const { return _schema; }
     schema_ptr& schema() { return _schema; }
-    streamed_mutation read(lw_shared_ptr<memtable> mtbl, const schema_ptr&, const query::partition_slice&, streamed_mutation::forwarding);
+    lw_shared_ptr<partition_snapshot> snapshot(memtable& mtbl);
 
     size_t external_memory_usage_without_rows() const {
         return _key.key().external_memory_usage();
+    }
+
+    size_t size_in_allocator_without_rows(allocation_strategy& allocator) {
+        return allocator.object_memory_size_in_allocator(this) + external_memory_usage_without_rows();
+    }
+
+    size_t size_in_allocator(allocation_strategy& allocator) {
+        auto size = size_in_allocator_without_rows(allocator);
+        for (auto&& v : _pe.versions()) {
+            size += v.size_in_allocator(allocator);
+        }
+        return size;
     }
 
     struct compare {
@@ -92,6 +106,8 @@ public:
             return _c(k1, k2._key);
         }
     };
+
+    friend std::ostream& operator<<(std::ostream&, const memtable_entry&);
 };
 
 class dirty_memory_manager;
@@ -181,20 +197,21 @@ public:
     // The 'range' parameter must be live as long as the reader is being used
     //
     // Mutations returned by the reader will all have given schema.
-    mutation_reader make_reader(schema_ptr,
-                                const dht::partition_range& range,
-                                const query::partition_slice& slice,
-                                const io_priority_class& pc = default_priority_class(),
-                                tracing::trace_state_ptr trace_state_ptr = nullptr,
-                                streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
-                                mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
+    flat_mutation_reader make_flat_reader(schema_ptr,
+                                          const dht::partition_range& range,
+                                          const query::partition_slice& slice,
+                                          const io_priority_class& pc = default_priority_class(),
+                                          tracing::trace_state_ptr trace_state_ptr = nullptr,
+                                          streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
+                                          mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
 
-    mutation_reader make_reader(schema_ptr s, const dht::partition_range& range = query::full_partition_range) {
+    flat_mutation_reader make_flat_reader(schema_ptr s,
+                                          const dht::partition_range& range = query::full_partition_range) {
         auto& full_slice = s->full_slice();
-        return make_reader(s, range, full_slice);
+        return make_flat_reader(s, range, full_slice);
     }
 
-    mutation_reader make_flush_reader(schema_ptr, const io_priority_class& pc);
+    flat_mutation_reader make_flush_reader(schema_ptr, const io_priority_class& pc);
 
     mutation_source as_data_source();
 
@@ -211,4 +228,10 @@ public:
         return _rp_set;
     }
     friend class iterator_reader;
+
+    dirty_memory_manager& get_dirty_memory_manager() {
+        return _dirty_mgr;
+    }
+
+    friend std::ostream& operator<<(std::ostream&, memtable&);
 };

@@ -90,11 +90,13 @@ class create_table_statement : public schema_altering_statement {
     column_set_type _static_columns;
     const ::shared_ptr<cf_prop_defs> _properties;
     const bool _if_not_exists;
+    stdx::optional<utils::UUID> _id;
 public:
     create_table_statement(::shared_ptr<cf_name> name,
                            ::shared_ptr<cf_prop_defs> properties,
                            bool if_not_exists,
-                           column_set_type static_columns);
+                           column_set_type static_columns,
+                           const stdx::optional<utils::UUID>& id);
 
     virtual future<> check_access(const service::client_state& state) override;
 
@@ -104,7 +106,9 @@ public:
 
     virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
 
-    schema_ptr get_cf_meta_data();
+    virtual future<> grant_permissions_to_creator(const service::client_state&) override;
+
+    schema_ptr get_cf_meta_data(const database&);
 
     class raw_statement;
 
@@ -112,7 +116,7 @@ public:
 private:
     std::vector<column_definition> get_columns();
 
-    void apply_properties_to(schema_builder& builder);
+    void apply_properties_to(schema_builder& builder, const database&);
 
     void add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind);
 };

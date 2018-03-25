@@ -241,7 +241,7 @@ public:
     using component_view = std::pair<bytes_view, eoc>;
 private:
     template<typename Value, typename = std::enable_if_t<!std::is_same<const data_value, std::decay_t<Value>>::value>>
-    static size_t size(Value& val) {
+    static size_t size(const Value& val) {
         return val.size();
     }
     static size_t size(const data_value& val) {
@@ -345,7 +345,7 @@ public:
                 }
                 len = read_simple<size_type>(_v);
                 if (_v.size() < len) {
-                    throw marshal_exception();
+                    throw_with_backtrace<marshal_exception>(sprint("composite iterator - not enough bytes, expected %d, got %d", len, _v.size()));
                 }
             }
             auto value = bytes_view(_v.begin(), len);
@@ -445,17 +445,16 @@ public:
         return _is_compound;
     }
 
-    // The following factory functions assume this composite is a compound value.
     template <typename ClusteringElement>
     static composite from_clustering_element(const schema& s, const ClusteringElement& ce) {
-        return serialize_value(ce.components(s));
+        return serialize_value(ce.components(s), s.is_compound());
     }
 
-    static composite from_exploded(const std::vector<bytes_view>& v, eoc marker = eoc::none) {
+    static composite from_exploded(const std::vector<bytes_view>& v, bool is_compound, eoc marker = eoc::none) {
         if (v.size() == 0) {
-            return composite(bytes(size_t(1), bytes::value_type(marker)));
+            return composite(bytes(size_t(1), bytes::value_type(marker)), is_compound);
         }
-        return serialize_value(v, true, marker);
+        return serialize_value(v, is_compound, marker);
     }
 
     static composite static_prefix(const schema& s) {

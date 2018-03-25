@@ -20,16 +20,12 @@
  */
 
 #include "tests/test-utils.hh"
-#include "disk-error-handler.hh"
 
 #include <seastar/core/thread.hh>
 
 #include "cell_locking.hh"
 #include "mutation.hh"
 #include "schema_builder.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
 
 static schema_ptr make_schema()
 {
@@ -75,8 +71,8 @@ static schema_ptr make_schema_disjoint_with_others()
 
 static data_value empty_value = data_value(to_bytes(""));
 
-static cell_locker::timeout_clock::time_point no_timeout {
-    cell_locker::timeout_clock::duration(std::numeric_limits<cell_locker::timeout_clock::duration::rep>::max())
+static db::timeout_clock::time_point no_timeout {
+    db::timeout_clock::duration(std::numeric_limits<db::timeout_clock::duration::rep>::max())
 };
 
 static auto make_row(const sstring& key, std::initializer_list<sstring> cells) {
@@ -86,7 +82,7 @@ static auto make_row(const sstring& key, std::initializer_list<sstring> cells) {
 static mutation make_mutation(schema_ptr s, const sstring& pk, std::initializer_list<sstring> static_cells,
                               std::initializer_list<std::pair<sstring, std::initializer_list<sstring>>> clustering_cells)
 {
-    auto m = mutation(partition_key::from_single_value(*s, to_bytes(pk)), s);
+    auto m = mutation(s, partition_key::from_single_value(*s, to_bytes(pk)));
     for (auto&& c : static_cells) {
         m.set_static_cell(to_bytes(c), empty_value, api::new_timestamp());
     }
@@ -136,7 +132,7 @@ SEASTAR_TEST_CASE(test_disjoint_mutations) {
                 make_row("one", { "r3" }),
         });
 
-        auto m3 = mutation(partition_key::from_single_value(*s, to_bytes("1")), s);
+        auto m3 = mutation(s, partition_key::from_single_value(*s, to_bytes("1")));
         m3.partition() = m1.partition();
 
         auto l1 = cl.lock_cells(m1.decorated_key(), partition_cells_range(m1.partition()), no_timeout).get0();
@@ -242,7 +238,7 @@ SEASTAR_TEST_CASE(test_timed_out) {
 
             auto l1 = cl.lock_cells(m1.decorated_key(), partition_cells_range(m1.partition()), no_timeout).get0();
 
-            auto timeout = cell_locker::timeout_clock::now() - std::chrono::hours(1);
+            auto timeout = saturating_subtract(db::timeout_clock::now(), std::chrono::hours(1));
             BOOST_REQUIRE_THROW(cl.lock_cells(m2.decorated_key(), partition_cells_range(m2.partition()), timeout).get0(),
                                 timed_out_error);
 

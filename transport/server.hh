@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "auth/service.hh"
 #include "core/reactor.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "service/migration_listener.hh"
@@ -117,9 +118,11 @@ private:
     uint64_t _requests_served = 0;
     uint64_t _unpaged_queries = 0;
     uint64_t _requests_serving = 0;
+    uint64_t _requests_blocked_memory = 0;
     cql_load_balance _lb;
+    auth::service& _auth_service;
 public:
-    cql_server(distributed<service::storage_proxy>& proxy, distributed<cql3::query_processor>& qp, cql_load_balance lb);
+    cql_server(distributed<service::storage_proxy>& proxy, distributed<cql3::query_processor>& qp, cql_load_balance lb, auth::service&);
     future<> listen(ipv4_addr addr, std::shared_ptr<seastar::tls::credentials_builder> = {}, bool keepalive = false);
     future<> do_accepts(int which, bool keepalive, ipv4_addr server_addr);
     future<> stop();
@@ -131,6 +134,20 @@ private:
     friend class connection;
     friend class process_request_executor;
     class connection : public boost::intrusive::list_base_hook<> {
+        struct processing_result {
+            foreign_ptr<shared_ptr<cql_server::response>> cql_response;
+            foreign_ptr<std::unique_ptr<sstring>> keyspace;
+            foreign_ptr<shared_ptr<auth::authenticated_user>> user;
+            service::client_state::auth_state auth_state;
+
+            processing_result(response_type r)
+                : cql_response(make_foreign(std::move(r.first)))
+                , keyspace(r.second.is_dirty() ? make_foreign(std::make_unique<sstring>(std::move(r.second.get_raw_keyspace()))) : nullptr)
+                , user(r.second.user_is_dirty() ? make_foreign(r.second.user()) : nullptr)
+                , auth_state(r.second.get_auth_state())
+            {}
+        };
+
         cql_server& _server;
         ipv4_addr _server_addr;
         connected_socket _fd;
@@ -145,18 +162,11 @@ private:
         std::unordered_map<uint16_t, cql_query_state> _query_states;
         unsigned _request_cpu = 0;
 
-        enum class state : uint8_t {
-            UNINITIALIZED, AUTHENTICATION, READY
-        };
-
         enum class tracing_request_type : uint8_t {
             not_requested,
             no_write_on_close,
             write_on_close
         };
-
-        state _state = state::UNINITIALIZED;
-        ::shared_ptr<auth::authenticator::sasl_challenge> _sasl_challenge;
     public:
         connection(cql_server& server, ipv4_addr server_addr, connected_socket&& fd, socket_address addr);
         ~connection();
@@ -165,9 +175,10 @@ private:
         future<> shutdown();
     private:
         friend class process_request_executor;
-        future<response_type> process_request_one(bytes_view buf, uint8_t op, uint16_t stream, service::client_state client_state, tracing_request_type tracing_request);
+        future<processing_result> process_request_one(bytes_view buf, uint8_t op, uint16_t stream, service::client_state client_state, tracing_request_type tracing_request);
         unsigned frame_size() const;
         unsigned pick_request_cpu();
+        void update_client_state(processing_result& r);
         cql_binary_frame_v3 parse_frame(temporary_buffer<char> buf);
         future<temporary_buffer<char>> read_and_decompress_frame(size_t length, uint8_t flags);
         future<std::experimental::optional<cql_binary_frame_v3>> read_frame();
@@ -182,7 +193,9 @@ private:
 
         shared_ptr<cql_server::response> make_unavailable_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t required, int32_t alive, const tracing::trace_state_ptr& tr_state);
         shared_ptr<cql_server::response> make_read_timeout_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t blockfor, bool data_present, const tracing::trace_state_ptr& tr_state);
+        shared_ptr<cql_server::response> make_read_failure_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t numfailures, int32_t blockfor, bool data_present, const tracing::trace_state_ptr& tr_state);
         shared_ptr<cql_server::response> make_mutation_write_timeout_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t blockfor, db::write_type type, const tracing::trace_state_ptr& tr_state);
+        shared_ptr<cql_server::response> make_mutation_write_failure_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t numfailures, int32_t blockfor, db::write_type type, const tracing::trace_state_ptr& tr_state);
         shared_ptr<cql_server::response> make_already_exists_error(int16_t stream, exceptions::exception_code err, sstring msg, sstring ks_name, sstring cf_name, const tracing::trace_state_ptr& tr_state);
         shared_ptr<cql_server::response> make_unprepared_error(int16_t stream, exceptions::exception_code err, sstring msg, bytes id, const tracing::trace_state_ptr& tr_state);
         shared_ptr<cql_server::response> make_error(int16_t stream, exceptions::exception_code err, sstring msg, const tracing::trace_state_ptr& tr_state);

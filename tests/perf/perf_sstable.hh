@@ -22,6 +22,8 @@
 #pragma once
 #include "../sstable_test.hh"
 #include "sstables/sstables.hh"
+#include "sstables/compaction_manager.hh"
+#include "cell_locking.hh"
 #include "mutation_reader.hh"
 #include "memtable-sstable.hh"
 #include <boost/accumulators/accumulators.hpp>
@@ -37,6 +39,7 @@ public:
         unsigned key_size;
         unsigned num_columns;
         unsigned column_size;
+        unsigned sstables;
         size_t buffer_size;
         sstring dir;
     };
@@ -103,10 +106,10 @@ public:
     future<> stop() { return make_ready_future<>(); }
 
     future<> fill_memtable() {
-        auto idx = boost::irange(0, int(_cfg.partitions));
+        auto idx = boost::irange(0, int(_cfg.partitions / _cfg.sstables));
         return do_for_each(idx.begin(), idx.end(), [this] (auto iteration) {
             auto key = partition_key::from_deeply_exploded(*s, { this->random_key() });
-            auto mut = mutation(key, this->s);
+            auto mut = mutation(this->s, key);
             for (auto& cdef: this->s->regular_columns()) {
                 mut.set_clustered_cell(clustering_key::make_empty(), cdef, atomic_cell::make_live(0, utf8_type->decompose(this->random_column())));
             }
@@ -128,15 +131,55 @@ public:
 
     // Mappers below
     future<double> flush_memtable(int idx) {
-        auto start = test_env::now();
-        size_t partitions = _mt->partition_count();
-        return test_setup::create_empty_test_dir(dir()).then([this, idx] {
+        return seastar::async([this, idx] {
+            storage_service_for_tests ssft;
+            size_t partitions = _mt->partition_count();
+
+            test_setup::create_empty_test_dir(dir()).get();
             auto sst = sstables::test::make_test_sstable(_cfg.buffer_size, s, dir(), idx, sstable::version_types::ka, sstable::format_types::big);
-            return write_memtable_to_sstable(*_mt, sst).then([sst] {});
-        }).then([start, partitions] {
+
+            auto start = test_env::now();
+            write_memtable_to_sstable(*_mt, sst).get();
             auto end = test_env::now();
+
+            _mt->revert_flushed_memory();
+
             auto duration = std::chrono::duration<double>(end - start).count();
             return partitions / duration;
+        });
+    }
+
+    future<double> compaction(int idx) {
+        return test_setup::create_empty_test_dir(dir()).then([this, idx] {
+            return seastar::async([this, idx] {
+                storage_service_for_tests ssft;
+                auto sst_gen = [this, gen = make_lw_shared<unsigned>(idx)] () mutable {
+                    return sstables::test::make_test_sstable(_cfg.buffer_size, s, dir(), (*gen)++, sstable::version_types::ka, sstable::format_types::big);
+                };
+
+                std::vector<shared_sstable> ssts;
+                for (auto i = 0u; i < _cfg.sstables; i++) {
+                    auto sst = sst_gen();
+                    write_memtable_to_sstable(*_mt, sst).get();
+                    sst->open_data().get();
+                    _mt->revert_flushed_memory();
+                    ssts.push_back(std::move(sst));
+                }
+
+                cell_locker_stats cl_stats;
+                auto cm = make_lw_shared<compaction_manager>();
+                auto cf = make_lw_shared<column_family>(s, column_family::config(), column_family::no_commitlog(), *cm, cl_stats);
+
+                auto start = test_env::now();
+                auto ret = sstables::compact_sstables(sstables::compaction_descriptor(std::move(ssts)), *cf, sst_gen).get0();
+                auto end = test_env::now();
+
+                auto partitions_per_sstable = _cfg.partitions / _cfg.sstables;
+                assert(ret.total_keys_written == partitions_per_sstable);
+
+                auto duration = std::chrono::duration<double>(end - start).count();
+                return ret.total_keys_written / duration;
+            });
         });
     }
 
@@ -153,14 +196,12 @@ public:
     }
 
     future<double> read_sequential_partitions(int idx) {
-        return do_with(_sst[0]->read_rows(s), [this] (sstables::mutation_reader& r) {
+        return do_with(_sst[0]->read_rows_flat(s), [this] (flat_mutation_reader& r) {
             auto start = test_env::now();
             auto total = make_lw_shared<size_t>(0);
             auto done = make_lw_shared<bool>(false);
             return do_until([done] { return *done; }, [this, done, total, &r] {
-                return r.read().then([] (auto sm) {
-                    return mutation_from_streamed_mutation(std::move(sm));
-                }).then([this, done, total] (mutation_opt m) {
+                return read_mutation_from_flat_mutation_reader(r).then([this, done, total] (mutation_opt m) {
                     if (!m) {
                         *done = true;
                     } else {

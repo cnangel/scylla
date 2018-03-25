@@ -142,24 +142,14 @@ public:
         }
 
         // Find fully expired SSTables. Those will be included no matter what.
-        auto expired = get_fully_expired_sstables(cf, uncompacting, gc_before.time_since_epoch().count());
+        auto expired = get_fully_expired_sstables(cf, uncompacting, gc_before);
 
-        auto sort_ssts = [] (std::vector<sstables::shared_sstable>& sstables) {
-            std::sort(sstables.begin(), sstables.end(), [] (const auto& x, const auto& y) {
-                return x->generation() < y->generation();
-            });
-        };
-        sort_ssts(uncompacting);
-        sort_ssts(expired);
+        if (!expired.empty()) {
+            auto is_expired = [&] (const sstables::shared_sstable& s) { return expired.find(s) != expired.end(); };
+            uncompacting.erase(boost::remove_if(uncompacting, is_expired), uncompacting.end());
+        }
 
-        std::vector<sstables::shared_sstable> non_expired_set;
-        // Set non_expired_set with the elements that are in uncompacting, but not in the expired.
-        std::set_difference(uncompacting.begin(), uncompacting.end(), expired.begin(), expired.end(),
-            std::inserter(non_expired_set, non_expired_set.begin()), [] (const auto& x, const auto& y) {
-                return x->generation() < y->generation();
-            });
-
-        auto compaction_candidates = get_next_non_expired_sstables(cf, non_expired_set, gc_before);
+        auto compaction_candidates = get_next_non_expired_sstables(cf, uncompacting, gc_before);
         if (!expired.empty()) {
             compaction_candidates.insert(compaction_candidates.end(), expired.begin(), expired.end());
         }
@@ -418,25 +408,9 @@ namespace sstables {
 
 class date_tiered_compaction_strategy : public compaction_strategy_impl {
     date_tiered_manifest _manifest;
+    compaction_backlog_tracker _backlog_tracker;
 public:
-    date_tiered_compaction_strategy(const std::map<sstring, sstring>& options)
-        : compaction_strategy_impl(options), _manifest(options)
-    {
-        // tombstone compaction is disabled by default because:
-        // - deletion shouldn't be used with DTCS; rather data is deleted through TTL.
-        // - with time series workloads, it's usually better to wait for whole sstable to be expired rather than
-        // compacting a single sstable when it's more than 20% (default value) expired.
-        // For more details, see CASSANDRA-9234
-        if (!options.count(TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.count(TOMBSTONE_THRESHOLD_OPTION)) {
-            _disable_tombstone_compaction = true;
-            date_tiered_manifest::logger.debug("Disabling tombstone compactions for DTCS");
-        } else {
-            date_tiered_manifest::logger.debug("Enabling tombstone compactions for DTCS");
-        }
-
-        _use_clustering_key_filter = true;
-    }
-
+    date_tiered_compaction_strategy(const std::map<sstring, sstring>& options);
     virtual compaction_descriptor get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) override {
         auto gc_before = gc_clock::now() - cfs.schema()->gc_grace_seconds();
         auto sstables = _manifest.get_next_sstables(cfs, candidates, gc_before);
@@ -468,6 +442,10 @@ public:
 
     virtual compaction_strategy_type type() const {
         return compaction_strategy_type::date_tiered;
+    }
+
+    virtual compaction_backlog_tracker& get_backlog_tracker() override {
+        return _backlog_tracker;
     }
 };
 

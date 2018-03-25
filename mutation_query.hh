@@ -25,6 +25,9 @@
 #include "query-result.hh"
 #include "mutation_reader.hh"
 #include "frozen_mutation.hh"
+#include "db/timeout_clock.hh"
+#include "querier.hh"
+#include <seastar/core/execution_stage.hh>
 
 class reconcilable_result;
 class frozen_reconcilable_result;
@@ -105,7 +108,7 @@ public:
     printer pretty_printer(schema_ptr) const;
 };
 
-query::result to_data_query_result(const reconcilable_result&, schema_ptr, const query::partition_slice&, uint32_t row_limit, uint32_t partition_limit, query::result_request result_type = query::result_request::only_result);
+query::result to_data_query_result(const reconcilable_result&, schema_ptr, const query::partition_slice&, uint32_t row_limit, uint32_t partition_limit, query::result_options opts = query::result_options::only_result());
 
 // Performs a query on given data source returning data in reconcilable form.
 //
@@ -127,7 +130,9 @@ future<reconcilable_result> mutation_query(
     uint32_t partition_limit,
     gc_clock::time_point query_time,
     query::result_memory_accounter&& accounter = { },
-    tracing::trace_state_ptr trace_ptr = nullptr);
+    tracing::trace_state_ptr trace_ptr = nullptr,
+    db::timeout_clock::time_point timeout = db::no_timeout,
+    querier_cache_context cache_ctx = { });
 
 future<> data_query(
     schema_ptr s,
@@ -138,7 +143,29 @@ future<> data_query(
     uint32_t partition_limit,
     gc_clock::time_point query_time,
     query::result::builder& builder,
-    tracing::trace_state_ptr trace_ptr = nullptr);
+    tracing::trace_state_ptr trace_ptr = nullptr,
+    db::timeout_clock::time_point timeout = db::no_timeout,
+    querier_cache_context cache_ctx = { });
+
+
+class mutation_query_stage {
+    concrete_execution_stage<future<reconcilable_result>,
+        schema_ptr,
+        mutation_source,
+        const dht::partition_range&,
+        const query::partition_slice&,
+        uint32_t,
+        uint32_t,
+        gc_clock::time_point,
+        query::result_memory_accounter&&,
+        tracing::trace_state_ptr,
+        db::timeout_clock::time_point,
+        querier_cache_context> _execution_stage;
+public:
+    explicit mutation_query_stage(seastar::scheduling_group sg);
+    template <typename... Args>
+    future<reconcilable_result> operator()(Args&&... args) { return _execution_stage(std::forward<Args>(args)...); }
+};
 
 // Performs a query for counter updates.
 future<mutation_opt> counter_write_query(schema_ptr, const mutation_source&,

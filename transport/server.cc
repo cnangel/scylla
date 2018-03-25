@@ -260,13 +260,14 @@ private:
     }
 };
 
-cql_server::cql_server(distributed<service::storage_proxy>& proxy, distributed<cql3::query_processor>& qp, cql_load_balance lb)
+cql_server::cql_server(distributed<service::storage_proxy>& proxy, distributed<cql3::query_processor>& qp, cql_load_balance lb, auth::service& auth_service)
     : _proxy(proxy)
     , _query_processor(qp)
     , _max_request_size(memory::stats().total_memory() / 10)
     , _memory_available(_max_request_size)
     , _notifier(std::make_unique<event_notifier>())
     , _lb(lb)
+    , _auth_service(auth_service)
 {
     namespace sm = seastar::metrics;
 
@@ -286,10 +287,15 @@ cql_server::cql_server(distributed<service::storage_proxy>& proxy, distributed<c
         sm::make_counter("unpaged_queries", _unpaged_queries,
                         sm::description("The number of unpaged queries served.")),
 
-        sm::make_gauge("requests_blocked_memory", [this] { return _memory_available.waiters(); },
+        sm::make_gauge("requests_blocked_memory_current", [this] { return _memory_available.waiters(); },
                         sm::description(
-                            seastar::format("Holds a number of requests that are blocked due to reaching the memory quota limit ({}B). "
+                            seastar::format("Holds the number of requests that are currently blocked due to reaching the memory quota limit ({}B). "
                                             "Non-zero value indicates that our bottleneck is memory and more specifically - the memory quota allocated for the \"CQL transport\" component.", _max_request_size))),
+        sm::make_derive("requests_blocked_memory", _requests_blocked_memory,
+                        sm::description(
+                            seastar::format("Holds an incrementing counter with the requests that ever blocked due to reaching the memory quota limit ({}B). "
+                                            "The first derivative of this value shows how often we block due to memory exhaustion in the \"CQL transport\" component.", _max_request_size))),
+
     });
 }
 
@@ -446,8 +452,10 @@ cql_server::connection::read_frame() {
     }
 }
 
-future<response_type>
+future<cql_server::connection::processing_result>
     cql_server::connection::process_request_one(bytes_view buf, uint8_t op, uint16_t stream, service::client_state client_state, tracing_request_type tracing_request) {
+    using auth_state = service::client_state::auth_state;
+
     auto cqlop = static_cast<cql_binary_opcode>(op);
     tracing::trace_state_props_set trace_props;
 
@@ -467,26 +475,35 @@ future<response_type>
     return make_ready_future<>().then([this, cqlop, stream, buf = std::move(buf), client_state] () mutable {
         // When using authentication, we need to ensure we are doing proper state transitions,
         // i.e. we cannot simply accept any query/exec ops unless auth is complete
-        switch (_state) {
-            case state::UNINITIALIZED:
+        switch (client_state.get_auth_state()) {
+            case auth_state::UNINITIALIZED:
                 if (cqlop != cql_binary_opcode::STARTUP && cqlop != cql_binary_opcode::OPTIONS) {
                     throw exceptions::protocol_exception(sprint("Unexpected message %d, expecting STARTUP or OPTIONS", int(cqlop)));
                 }
                 break;
-            case state::AUTHENTICATION:
+            case auth_state::AUTHENTICATION:
                 // Support both SASL auth from protocol v2 and the older style Credentials auth from v1
                 if (cqlop != cql_binary_opcode::AUTH_RESPONSE && cqlop != cql_binary_opcode::CREDENTIALS) {
                     throw exceptions::protocol_exception(sprint("Unexpected message %d, expecting %s", int(cqlop), _version == 1 ? "CREDENTIALS" : "SASL_RESPONSE"));
                 }
                 break;
-            case state::READY: default:
+            case auth_state::READY: default:
                 if (cqlop == cql_binary_opcode::STARTUP) {
                     throw exceptions::protocol_exception("Unexpected message STARTUP, the connection is already initialized");
                 }
                 break;
         }
 
-        tracing::set_username(client_state.get_trace_state(), client_state.user());
+        const auto user = [&client_state]() -> stdx::optional<auth::authenticated_user> {
+            const auto user = client_state.user();
+            if (!user) {
+                return {};
+            }
+
+            return *user;
+        }();
+
+        tracing::set_username(client_state.get_trace_state(), user);
 
         switch (cqlop) {
         case cql_binary_opcode::STARTUP:       return process_startup(stream, std::move(buf), std::move(client_state));
@@ -503,48 +520,52 @@ future<response_type>
         --_server._requests_serving;
         try {
             response_type response = f.get0();
+            service::client_state& resp_client_state = response.second;
             auto res_op = response.first->opcode();
+
             // and modify state now that we've generated a response.
-            switch (_state) {
-                case state::UNINITIALIZED:
+            switch (client_state.get_auth_state()) {
+                case auth_state::UNINITIALIZED:
                     if (cqlop == cql_binary_opcode::STARTUP) {
                         if (res_op == cql_binary_opcode::AUTHENTICATE) {
-                            _state = state::AUTHENTICATION;
+                            resp_client_state.set_auth_state(auth_state::AUTHENTICATION);
                         } else if (res_op == cql_binary_opcode::READY) {
-                            _state = state::READY;
+                            resp_client_state.set_auth_state(auth_state::READY);
                         }
                     }
                     break;
-                case state::AUTHENTICATION:
+                case auth_state::AUTHENTICATION:
                     // Support both SASL auth from protocol v2 and the older style Credentials auth from v1
                     assert(cqlop == cql_binary_opcode::AUTH_RESPONSE || cqlop == cql_binary_opcode::CREDENTIALS);
                     if (res_op == cql_binary_opcode::READY || res_op == cql_binary_opcode::AUTH_SUCCESS) {
-                        _state = state::READY;
-                        // we won't use the authenticator again, null it
-                        _sasl_challenge = nullptr;
+                        resp_client_state.set_auth_state(auth_state::READY);
                     }
                     break;
                 default:
-                case state::READY:
+                case auth_state::READY:
                     break;
             }
-            return make_ready_future<response_type>(response);
+            return make_ready_future<processing_result>(std::move(response));
         } catch (const exceptions::unavailable_exception& ex) {
-            return make_ready_future<response_type>(std::make_pair(make_unavailable_error(stream, ex.code(), ex.what(), ex.consistency, ex.required, ex.alive, client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_unavailable_error(stream, ex.code(), ex.what(), ex.consistency, ex.required, ex.alive, client_state.get_trace_state()), client_state));
         } catch (const exceptions::read_timeout_exception& ex) {
-            return make_ready_future<response_type>(std::make_pair(make_read_timeout_error(stream, ex.code(), ex.what(), ex.consistency, ex.received, ex.block_for, ex.data_present, client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_read_timeout_error(stream, ex.code(), ex.what(), ex.consistency, ex.received, ex.block_for, ex.data_present, client_state.get_trace_state()), client_state));
+        } catch (const exceptions::read_failure_exception& ex) {
+            return make_ready_future<processing_result>(std::make_pair(make_read_failure_error(stream, ex.code(), ex.what(), ex.consistency, ex.received, ex.failures, ex.block_for, ex.data_present, client_state.get_trace_state()), client_state));
         } catch (const exceptions::mutation_write_timeout_exception& ex) {
-            return make_ready_future<response_type>(std::make_pair(make_mutation_write_timeout_error(stream, ex.code(), ex.what(), ex.consistency, ex.received, ex.block_for, ex.type, client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_mutation_write_timeout_error(stream, ex.code(), ex.what(), ex.consistency, ex.received, ex.block_for, ex.type, client_state.get_trace_state()), client_state));
+        } catch (const exceptions::mutation_write_failure_exception& ex) {
+            return make_ready_future<processing_result>(std::make_pair(make_mutation_write_failure_error(stream, ex.code(), ex.what(), ex.consistency, ex.received, ex.failures, ex.block_for, ex.type, client_state.get_trace_state()), client_state));
         } catch (const exceptions::already_exists_exception& ex) {
-            return make_ready_future<response_type>(std::make_pair(make_already_exists_error(stream, ex.code(), ex.what(), ex.ks_name, ex.cf_name, client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_already_exists_error(stream, ex.code(), ex.what(), ex.ks_name, ex.cf_name, client_state.get_trace_state()), client_state));
         } catch (const exceptions::prepared_query_not_found_exception& ex) {
-            return make_ready_future<response_type>(std::make_pair(make_unprepared_error(stream, ex.code(), ex.what(), ex.id, client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_unprepared_error(stream, ex.code(), ex.what(), ex.id, client_state.get_trace_state()), client_state));
         } catch (const exceptions::cassandra_exception& ex) {
-            return make_ready_future<response_type>(std::make_pair(make_error(stream, ex.code(), ex.what(), client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_error(stream, ex.code(), ex.what(), client_state.get_trace_state()), client_state));
         } catch (std::exception& ex) {
-            return make_ready_future<response_type>(std::make_pair(make_error(stream, exceptions::exception_code::SERVER_ERROR, ex.what(), client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_error(stream, exceptions::exception_code::SERVER_ERROR, ex.what(), client_state.get_trace_state()), client_state));
         } catch (...) {
-            return make_ready_future<response_type>(std::make_pair(make_error(stream, exceptions::exception_code::SERVER_ERROR, "unknown error", client_state.get_trace_state()), client_state));
+            return make_ready_future<processing_result>(std::make_pair(make_error(stream, exceptions::exception_code::SERVER_ERROR, "unknown error", client_state.get_trace_state()), client_state));
         }
     }).finally([tracing_state = client_state.get_trace_state()] {
         tracing::stop_foreground(tracing_state);
@@ -557,7 +578,7 @@ cql_server::connection::connection(cql_server& server, ipv4_addr server_addr, co
     , _fd(std::move(fd))
     , _read_buf(_fd.input())
     , _write_buf(_fd.output())
-    , _client_state(service::client_state::external_tag{}, addr)
+    , _client_state(service::client_state::external_tag{}, server._auth_service, addr)
 {
     ++_server._total_connections;
     ++_server._current_connections;
@@ -614,6 +635,32 @@ struct process_request_executor {
 };
 static thread_local auto process_request_stage = seastar::make_execution_stage("transport", process_request_executor::get());
 
+void cql_server::connection::update_client_state(processing_result& response) {
+    if (response.keyspace) {
+        if (response.keyspace.get_owner_shard() != engine().cpu_id()) {
+            _client_state.set_raw_keyspace(*response.keyspace);
+        } else {
+            // Avoid extra copy if we are on the same shard
+            _client_state.set_raw_keyspace(std::move(*response.keyspace));
+        }
+    }
+
+    if (response.user) {
+        if (response.user.get_owner_shard() != engine().cpu_id()) {
+            if (!_client_state.user() || *_client_state.user() != *response.user) {
+                _client_state.set_login(make_shared<auth::authenticated_user>(*response.user));
+            }
+        } else if (!_client_state.user()) {
+            // If we are on the same shard there is no need to copy unless _client_state._user == nullptr
+            _client_state.set_login(response.user.release());
+        }
+    }
+
+    if (_client_state.get_auth_state() != response.auth_state) {
+        _client_state.set_auth_state(response.auth_state);
+    }
+}
+
 future<> cql_server::connection::process_request() {
     return read_frame().then_wrapped([this] (future<std::experimental::optional<cql_binary_frame_v3>>&& v) {
         auto maybe_frame = std::get<0>(v.get());
@@ -642,7 +689,12 @@ future<> cql_server::connection::process_request() {
                     f.length, mem_estimate, _server._max_request_size));
         }
 
-        return get_units(_server._memory_available, mem_estimate).then([this, length = f.length, flags = f.flags, op, stream, tracing_requested] (semaphore_units<> mem_permit) {
+        auto fut = get_units(_server._memory_available, mem_estimate);
+        if (_server._memory_available.waiters()) {
+            ++_server._requests_blocked_memory;
+        }
+
+        return fut.then([this, length = f.length, flags = f.flags, op, stream, tracing_requested] (semaphore_units<> mem_permit) {
           return this->read_and_decompress_frame(length, flags).then([this, flags, op, stream, tracing_requested, mem_permit = std::move(mem_permit)] (temporary_buffer<char> buf) mutable {
 
             ++_server._requests_served;
@@ -651,13 +703,17 @@ future<> cql_server::connection::process_request() {
             with_gate(_pending_requests_gate, [this, flags, op, stream, buf = std::move(buf), tracing_requested, mem_permit = std::move(mem_permit)] () mutable {
                 auto bv = bytes_view{reinterpret_cast<const int8_t*>(buf.begin()), buf.size()};
                 auto cpu = pick_request_cpu();
-                return smp::submit_to(cpu, [this, bv = std::move(bv), op, stream, client_state = _client_state, tracing_requested] () mutable {
-                    return process_request_stage(this, bv, op, stream, std::move(client_state), tracing_requested).then([] (auto&& response) {
-                        return std::make_pair(make_foreign(response.first), response.second);
-                    });
-                }).then([this, flags] (auto&& response) {
-                    _client_state.merge(response.second);
-                    return this->write_response(std::move(response.first), _compression);
+                return [&] {
+                    if (cpu == engine().cpu_id()) {
+                        return process_request_stage(this, bv, op, stream, service::client_state(service::client_state::request_copy_tag{}, _client_state, _client_state.get_timestamp()), tracing_requested);
+                    } else {
+                        return smp::submit_to(cpu, [this, bv = std::move(bv), op, stream, client_state = _client_state, tracing_requested, ts = _client_state.get_timestamp()] () mutable {
+                            return process_request_stage(this, bv, op, stream, service::client_state(service::client_state::request_copy_tag{}, client_state, ts), tracing_requested);
+                        });
+                    }
+                }().then([this, flags] (auto&& response) {
+                    update_client_state(response);
+                    return this->write_response(std::move(response.cql_response), _compression);
                 }).then([buf = std::move(buf), mem_permit = std::move(mem_permit)] {
                     // Keep buf alive.
                 });
@@ -748,23 +804,20 @@ future<response_type> cql_server::connection::process_startup(uint16_t stream, b
              throw exceptions::protocol_exception(sprint("Unknown compression algorithm: %s", compression));
          }
     }
-    auto& a = auth::authenticator::get();
+    auto& a = client_state.get_auth_service()->underlying_authenticator();
     if (a.require_authentication()) {
-        return make_ready_future<response_type>(std::make_pair(make_autheticate(stream, a.class_name(), client_state.get_trace_state()), client_state));
+        return make_ready_future<response_type>(std::make_pair(make_autheticate(stream, a.qualified_java_name(), client_state.get_trace_state()), client_state));
     }
     return make_ready_future<response_type>(std::make_pair(make_ready(stream, client_state.get_trace_state()), client_state));
 }
 
 future<response_type> cql_server::connection::process_auth_response(uint16_t stream, bytes_view buf, service::client_state client_state)
 {
-    if (_sasl_challenge == nullptr) {
-        _sasl_challenge = auth::authenticator::get().new_sasl_challenge();
-    }
-
-    auto challenge = _sasl_challenge->evaluate_response(buf);
-    if (_sasl_challenge->is_complete()) {
-        return _sasl_challenge->get_authenticated_user().then([this, stream, client_state = std::move(client_state), challenge = std::move(challenge)](::shared_ptr<auth::authenticated_user> user) mutable {
-            client_state.set_login(std::move(user));
+    auto sasl_challenge = client_state.get_auth_service()->underlying_authenticator().new_sasl_challenge();
+    auto challenge = sasl_challenge->evaluate_response(buf);
+    if (sasl_challenge->is_complete()) {
+        return sasl_challenge->get_authenticated_user().then([this, sasl_challenge, stream, client_state = std::move(client_state), challenge = std::move(challenge)](auth::authenticated_user user) mutable {
+            client_state.set_login(::make_shared<auth::authenticated_user>(std::move(user)));
             auto f = client_state.check_user_exists();
             return f.then([this, stream, client_state = std::move(client_state), challenge = std::move(challenge)]() mutable {
                 auto tr_state = client_state.get_trace_state();
@@ -830,7 +883,7 @@ future<response_type> cql_server::connection::process_prepare(uint16_t stream, b
     const auto& cs = *client_state;
     return parallel_for_each(cpus.begin(), cpus.end(), [this, query, cpu_id, &cs] (unsigned int c) mutable {
         if (c != cpu_id) {
-            return smp::submit_to(c, [this, query = std::move(query), &cs] () mutable {
+            return smp::submit_to(c, [this, query, &cs] () mutable {
                 return _server._query_processor.local().prepare(std::move(query), cs, false).discard_result();
             });
         } else {
@@ -1018,6 +1071,22 @@ shared_ptr<cql_server::response> cql_server::connection::make_read_timeout_error
     return response;
 }
 
+shared_ptr<cql_server::response> cql_server::connection::make_read_failure_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t numfailures, int32_t blockfor, bool data_present, const tracing::trace_state_ptr& tr_state)
+{
+    if (_version < 4) {
+        return make_read_timeout_error(stream, err, std::move(msg), cl, received, blockfor, data_present, tr_state);
+    }
+    auto response = make_shared<cql_server::response>(stream, cql_binary_opcode::ERROR, tr_state);
+    response->write_int(static_cast<int32_t>(err));
+    response->write_string(msg);
+    response->write_consistency(cl);
+    response->write_int(received);
+    response->write_int(blockfor);
+    response->write_int(numfailures);
+    response->write_byte(data_present);
+    return response;
+}
+
 shared_ptr<cql_server::response> cql_server::connection::make_mutation_write_timeout_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t blockfor, db::write_type type, const tracing::trace_state_ptr& tr_state)
 {
     auto response = make_shared<cql_server::response>(stream, cql_binary_opcode::ERROR, tr_state);
@@ -1026,6 +1095,22 @@ shared_ptr<cql_server::response> cql_server::connection::make_mutation_write_tim
     response->write_consistency(cl);
     response->write_int(received);
     response->write_int(blockfor);
+    response->write_string(sprint("%s", type));
+    return response;
+}
+
+shared_ptr<cql_server::response> cql_server::connection::make_mutation_write_failure_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t numfailures, int32_t blockfor, db::write_type type, const tracing::trace_state_ptr& tr_state)
+{
+    if (_version < 4) {
+        return make_mutation_write_timeout_error(stream, err, std::move(msg), cl, received, blockfor, type, tr_state);
+    }
+    auto response = make_shared<cql_server::response>(stream, cql_binary_opcode::ERROR, tr_state);
+    response->write_int(static_cast<int32_t>(err));
+    response->write_string(msg);
+    response->write_consistency(cl);
+    response->write_int(received);
+    response->write_int(blockfor);
+    response->write_int(numfailures);
     response->write_string(sprint("%s", type));
     return response;
 }

@@ -40,6 +40,7 @@
  */
 
 #include "cql3/statements/cf_prop_defs.hh"
+#include "db/extensions.hh"
 
 #include <boost/algorithm/string/predicate.hpp>
 
@@ -65,11 +66,13 @@ const sstring cf_prop_defs::KW_COMPACTION = "compaction";
 const sstring cf_prop_defs::KW_COMPRESSION = "compression";
 const sstring cf_prop_defs::KW_CRC_CHECK_CHANCE = "crc_check_chance";
 
+const sstring cf_prop_defs::KW_ID = "id";
+
 const sstring cf_prop_defs::COMPACTION_STRATEGY_CLASS_KEY = "class";
 
 const sstring cf_prop_defs::COMPACTION_ENABLED_KEY = "enabled";
 
-void cf_prop_defs::validate() {
+void cf_prop_defs::validate(const db::extensions& exts) {
     // Skip validation if the comapction strategy class is already set as it means we've alreayd
     // prepared (and redoing it would set strategyClass back to null, which we don't want)
     if (_compaction_strategy_class) {
@@ -81,14 +84,20 @@ void cf_prop_defs::validate() {
         KW_GCGRACESECONDS, KW_CACHING, KW_DEFAULT_TIME_TO_LIVE,
         KW_MIN_INDEX_INTERVAL, KW_MAX_INDEX_INTERVAL, KW_SPECULATIVE_RETRY,
         KW_BF_FP_CHANCE, KW_MEMTABLE_FLUSH_PERIOD, KW_COMPACTION,
-        KW_COMPRESSION, KW_CRC_CHECK_CHANCE
+        KW_COMPRESSION, KW_CRC_CHECK_CHANCE, KW_ID
     });
     static std::set<sstring> obsolete_keywords({
         sstring("index_interval"),
         sstring("replicate_on_write"),
         sstring("populate_io_cache_on_flush"),
     });
-    property_definitions::validate(keywords, obsolete_keywords);
+    property_definitions::validate(keywords, exts.schema_extension_keywords(), obsolete_keywords);
+
+    try {
+        get_id();
+    } catch(...) {
+        std::throw_with_nested(exceptions::configuration_exception("Invalid table id"));
+    }
 
     auto compaction_options = get_compaction_options();
     if (!compaction_options.empty()) {
@@ -154,7 +163,16 @@ int32_t cf_prop_defs::get_gc_grace_seconds() const
     return get_int(KW_GCGRACESECONDS, DEFAULT_GC_GRACE_SECONDS);
 }
 
-void cf_prop_defs::apply_to_builder(schema_builder& builder) {
+stdx::optional<utils::UUID> cf_prop_defs::get_id() const {
+    auto id = get_simple(KW_ID);
+    if (id) {
+        return utils::UUID(*id);
+    }
+
+    return stdx::nullopt;
+}
+
+void cf_prop_defs::apply_to_builder(schema_builder& builder, const db::extensions& exts) {
     if (has_property(KW_COMMENT)) {
         builder.set_comment(get_string(KW_COMMENT, ""));
     }
@@ -232,6 +250,15 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder) {
     if (cachingOptions != null)
         cfm.caching(cachingOptions);
 #endif
+
+    schema::extensions_map er;
+    for (auto& p : exts.schema_extensions()) {
+        auto i = _properties.find(p.first);
+        if (i != _properties.end()) {
+            std::visit([&](auto& v) { er.emplace(p.first, p.second(v)); }, i->second);
+        }
+    }
+    builder.set_extensions(std::move(er));
 }
 
 void cf_prop_defs::validate_minimum_int(const sstring& field, int32_t minimum_value, int32_t default_value) const

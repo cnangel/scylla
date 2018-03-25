@@ -28,8 +28,9 @@
 #include "schema.hh"
 #include "dht/i_partitioner.hh"
 #include "hashing.hh"
-#include "utils/optimized_optional.hh"
-#include "streamed_mutation.hh"
+#include "mutation_fragment.hh"
+
+#include <seastar/util/optimized_optional.hh>
 
 class mutation final {
 private:
@@ -49,10 +50,10 @@ private:
     explicit operator bool() const { return bool(_ptr); }
     friend class optimized_optional<mutation>;
 public:
-    mutation(dht::decorated_key key, schema_ptr schema)
+    mutation(schema_ptr schema, dht::decorated_key key)
         : _ptr(std::make_unique<data>(std::move(key), std::move(schema)))
     { }
-    mutation(partition_key key_, schema_ptr schema)
+    mutation(schema_ptr schema, partition_key key_)
         : _ptr(std::make_unique<data>(std::move(key_), std::move(schema)))
     { }
     mutation(schema_ptr schema, dht::decorated_key key, const mutation_partition& mp)
@@ -107,14 +108,14 @@ public:
 public:
     // The supplied partition_slice must be governed by this mutation's schema
     query::result query(const query::partition_slice&,
-        query::result_request request = query::result_request::only_result,
+        query::result_options opts = query::result_options::only_result(),
         gc_clock::time_point now = gc_clock::now(),
         uint32_t row_limit = query::max_rows) &&;
 
     // The supplied partition_slice must be governed by this mutation's schema
     // FIXME: Slower than the r-value version
     query::result query(const query::partition_slice&,
-        query::result_request request = query::result_request::only_result,
+        query::result_options opts = query::result_options::only_result(),
         gc_clock::time_point now = gc_clock::now(),
         uint32_t row_limit = query::max_rows) const&;
 
@@ -129,6 +130,7 @@ public:
 
     void apply(mutation&&);
     void apply(const mutation&);
+    void apply(const mutation_fragment&);
 
     mutation operator+(const mutation& other) const;
     mutation& operator+=(const mutation& other);
@@ -145,10 +147,6 @@ struct mutation_decorated_key_less_comparator {
     bool operator()(const mutation& m1, const mutation& m2) const;
 };
 
-template<>
-struct move_constructor_disengages<mutation> {
-    enum { value = true };
-};
 using mutation_opt = optimized_optional<mutation>;
 
 // Consistent with operator==()
@@ -159,7 +157,7 @@ struct appending_hash<mutation> {
     template<typename Hasher>
     void operator()(Hasher& h, const mutation& m) const {
         const schema& s = *m.schema();
-        m.key().feed_hash(h, s);
+        feed_hash(h, m.key(), s);
         m.partition().feed_hash(h, s);
     }
 };
@@ -187,5 +185,7 @@ boost::iterator_range<std::vector<mutation>::const_iterator> slice(
     const std::vector<mutation>& partitions,
     const dht::partition_range&);
 
-future<mutation_opt> mutation_from_streamed_mutation(streamed_mutation_opt sm);
-future<mutation> mutation_from_streamed_mutation(streamed_mutation& sm);
+class flat_mutation_reader;
+
+// Reads a single partition from a reader. Returns empty optional if there are no more partitions to be read.
+future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reader&);

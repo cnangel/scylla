@@ -38,8 +38,10 @@ public:
         auto prev = dht::ring_position::min();
         _r->read_partition_data().get();
         while (!_r->eof()) {
-            auto k = _r->current_partition_entry().get_decorated_key();
-            auto rp = dht::ring_position(k.token(), k.key().to_partition_key(s));
+            auto& e = _r->current_partition_entry();
+            auto k = e.get_decorated_key();
+            auto token = dht::token(k.token());
+            auto rp = dht::ring_position(token, k.key().to_partition_key(s));
 
             if (!rp_cmp(prev, rp)) {
                 BOOST_FAIL(sprint("Partitions have invalid order: %s >= %s", prev, rp));
@@ -47,21 +49,35 @@ public:
 
             prev = rp;
 
-            auto* pi = _r->current_partition_entry().get_promoted_index(s);
-            if (!pi->entries.empty()) {
-                auto& prev = pi->entries[0];
-                for (size_t i = 1; i < pi->entries.size(); ++i) {
-                    auto& cur = pi->entries[i];
-                    if (!pos_cmp(prev.end, cur.start)) {
+            while (e.get_read_pi_blocks_count() < e.get_total_pi_blocks_count()) {
+                e.get_next_pi_blocks().get();
+                auto* infos = e.get_pi_blocks();
+                if (infos->empty()) {
+                    continue;
+                }
+                auto& prev = (*infos)[0];
+                for (size_t i = 1; i < infos->size(); ++i) {
+                    auto& cur = (*infos)[i];
+                    if (pos_cmp(cur.start(s), prev.end(s))) {
                         std::cout << "promoted index:\n";
-                        for (auto& e : pi->entries) {
-                            std::cout << "  " << e.start << "-" << e.end << ": +" << e.offset << " len=" << e.width << std::endl;
+                        for (auto& e : *infos) {
+                            std::cout << "  " << e.start(s) << "-" << e.end(s)
+                                      << ": +" << e.offset() << " len=" << e.width() << std::endl;
                         }
-                        BOOST_FAIL(sprint("Index blocks are not monotonic: %s >= %s", prev.end, cur.start));
+                        BOOST_FAIL(sprint("Index blocks are not monotonic: %s >= %s", prev.end(s), cur.start(s)));
                     }
                     cur = prev;
                 }
             }
+            _r->advance_to_next_partition().get();
+        }
+        return *this;
+    }
+
+    index_reader_assertions& is_empty(const schema& s) {
+        _r->read_partition_data().get();
+        while (!_r->eof()) {
+            BOOST_REQUIRE(_r->current_partition_entry().get_total_pi_blocks_count() == 0);
             _r->advance_to_next_partition().get();
         }
         return *this;

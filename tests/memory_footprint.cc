@@ -34,11 +34,7 @@
 #include "sstables/sstables.hh"
 #include "canonical_mutation.hh"
 #include "memtable-sstable.hh"
-#include "disk-error-handler.hh"
-#include "cql_test_env.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
+#include "test_services.hh"
 
 class size_calculator {
     class nest {
@@ -62,7 +58,6 @@ public:
         {
             nest n;
             std::cout << prefix() << "sizeof(decorated_key) = " << sizeof(dht::decorated_key) << "\n";
-            std::cout << prefix() << "sizeof(lru_link_type) = " << sizeof(cache_entry::lru_link_type) << "\n";
             std::cout << prefix() << "sizeof(cache_link_type) = " << sizeof(cache_entry::cache_link_type) << "\n";
             print_mutation_partition_size();
         }
@@ -70,6 +65,7 @@ public:
         std::cout << "\n";
 
         std::cout << prefix() << "sizeof(rows_entry) = " << sizeof(rows_entry) << "\n";
+        std::cout << prefix() << "sizeof(lru_link_type) = " << sizeof(rows_entry::lru_link_type) << "\n";
         std::cout << prefix() << "sizeof(deletable_row) = " << sizeof(deletable_row) << "\n";
         std::cout << prefix() << "sizeof(row) = " << sizeof(row) << "\n";
         std::cout << prefix() << "sizeof(atomic_cell_or_collection) = " << sizeof(atomic_cell_or_collection) << "\n";
@@ -103,7 +99,7 @@ static schema_ptr cassandra_stress_schema() {
 [[gnu::unused]]
 static mutation make_cs_mutation() {
     auto s = cassandra_stress_schema();
-    mutation m(partition_key::from_single_value(*s, bytes_type->from_string("4b343050393536353531")), s);
+    mutation m(s, partition_key::from_single_value(*s, bytes_type->from_string("4b343050393536353531")));
     for (auto&& col : s->regular_columns()) {
         m.set_clustered_cell(clustering_key::make_empty(), col,
             atomic_cell::make_live(1, bytes_type->from_string("8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a")));
@@ -148,7 +144,7 @@ static mutation make_mutation(mutation_settings settings) {
 
     auto s = builder.build();
 
-    mutation m(partition_key::from_single_value(*s, bytes_type->decompose(data_value(random_bytes(settings.partition_key_size)))), s);
+    mutation m(s, partition_key::from_single_value(*s, bytes_type->decompose(data_value(random_bytes(settings.partition_key_size)))));
 
     for (size_t i = 0; i < settings.row_count; ++i) {
         auto ck = clustering_key::from_single_value(*s, bytes_type->decompose(data_value(random_bytes(settings.clustering_key_size))));
@@ -188,7 +184,7 @@ static sizes calculate_sizes(const mutation& m) {
     result.cache = tracker.region().occupancy().used_space() - cache_initial_occupancy;     
     result.frozen = freeze(m).representation().size();
     result.canonical = canonical_mutation(m).representation().size();
-    result.query_result = m.query(partition_slice_builder(*s).build(), query::result_request::only_result).buf().size();
+    result.query_result = m.query(partition_slice_builder(*s).build(), query::result_options::only_result()).buf().size();
 
     tmpdir sstable_dir;
     auto sst = sstables::make_sstable(s,
@@ -215,8 +211,9 @@ int main(int argc, char** argv) {
         ("data-size", bpo::value<size_t>()->default_value(32), "cell data size");
 
     return app.run(argc, argv, [&] {
-      return do_with_cql_env([&] (auto&& env) {
         return seastar::async([&] {
+            storage_service_for_tests ssft;
+
             mutation_settings settings;
             settings.column_count = app.configuration()["column-count"].as<size_t>();
             settings.column_name_size = app.configuration()["column-name-size"].as<size_t>();
@@ -239,6 +236,5 @@ int main(int argc, char** argv) {
             std::cout << "\n";
             size_calculator::print_cache_entry_size();
         });
-      });
     });
 }

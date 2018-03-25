@@ -42,10 +42,11 @@
 #pragma once
 
 #include <unordered_set>
+
 #include <seastar/core/sstring.hh>
 
-#include "seastarx.hh"
 #include "enum_set.hh"
+#include "seastarx.hh"
 
 namespace auth {
 
@@ -66,9 +67,13 @@ enum class permission {
 
     // permission management
     AUTHORIZE, // required for GRANT and REVOKE.
+    DESCRIBE, // required on the root-level role resource to list all roles.
+
 };
 
-typedef enum_set<super_enum<permission,
+typedef enum_set<
+        super_enum<
+                permission,
                 permission::READ,
                 permission::WRITE,
                 permission::CREATE,
@@ -76,23 +81,21 @@ typedef enum_set<super_enum<permission,
                 permission::DROP,
                 permission::SELECT,
                 permission::MODIFY,
-                permission::AUTHORIZE>> permission_set;
+                permission::AUTHORIZE,
+                permission::DESCRIBE>> permission_set;
 
 bool operator<(const permission_set&, const permission_set&);
 
 namespace permissions {
 
-extern const permission_set ALL_DATA;
 extern const permission_set ALL;
 extern const permission_set NONE;
-extern const permission_set ALTERATIONS;
 
 const sstring& to_string(permission);
 permission from_string(const sstring&);
 
 std::unordered_set<sstring> to_strings(const permission_set&);
 permission_set from_strings(const std::unordered_set<sstring>&);
-
 
 }
 

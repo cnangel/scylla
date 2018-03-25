@@ -37,11 +37,7 @@
 #include "cql3/untyped_result_set.hh"
 #include "db/batchlog_manager.hh"
 
-#include "disk-error-handler.hh"
 #include "message/messaging_service.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
 
 static atomic_cell make_atomic_cell(bytes value) {
     return atomic_cell::make_live(0, std::move(value));
@@ -60,7 +56,7 @@ SEASTAR_TEST_CASE(test_execute_batch) {
             auto key = partition_key::from_exploded(*s, {to_bytes("key1")});
             auto c_key = clustering_key::from_exploded(*s, {int32_type->decompose(1)});
 
-            mutation m(key, s);
+            mutation m(s, key);
             m.set_clustered_cell(c_key, r1_col, make_atomic_cell(int32_type->decompose(100)));
 
             using namespace std::chrono_literals;

@@ -31,12 +31,12 @@
 #include "db/config.hh"
 #include "to_string.hh"
 #include "query-result-writer.hh"
-#include "nway_merger.hh"
 #include "cql3/column_identifier.hh"
 #include "core/seastar.hh"
 #include <seastar/core/sleep.hh>
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/execution_stage.hh>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include "sstables/sstables.hh"
@@ -61,34 +61,53 @@
 #include "service/storage_service.hh"
 #include "message/messaging_service.hh"
 #include "mutation_query.hh"
-#include "sstable_mutation_readers.hh"
 #include <core/fstream.hh>
 #include <seastar/core/enum.hh>
 #include "utils/latency.hh"
 #include "schema_registry.hh"
 #include "service/priority_manager.hh"
 #include "cell_locking.hh"
-#include <seastar/core/execution_stage.hh>
+#include "db/view/row_locking.hh"
 #include "view_info.hh"
 #include "memtable-sstable.hh"
 #include "db/schema_tables.hh"
 #include "db/query_context.hh"
 #include "sstables/compaction_manager.hh"
+#include "sstables/compaction_backlog_manager.hh"
 #include "sstables/progress_monitor.hh"
 
 #include "checked-file-impl.hh"
 #include "disk-error-handler.hh"
 
+#include "db/timeout_clock.hh"
+
 using namespace std::chrono_literals;
 
 logging::logger dblog("database");
 
-class permit_monitor final : public sstables::write_monitor {
+namespace {
+
+sstables::sstable::version_types get_highest_supported_format() {
+    if (service::get_local_storage_service().cluster_supports_la_sstable()) {
+        return sstables::sstable::version_types::la;
+    } else {
+        return sstables::sstable::version_types::ka;
+    }
+}
+
+} /* anonymous namespace */
+
+// Handles permit management only, used for situations where we don't want to inform
+// the compaction manager about backlogs (i.e., tests)
+class permit_monitor : public sstables::write_monitor {
     sstable_write_permit _permit;
 public:
     permit_monitor(sstable_write_permit&& permit)
             : _permit(std::move(permit)) {
     }
+
+    virtual void on_write_started(const sstables::writer_offset_tracker& t) override { }
+    virtual void on_data_write_completed() override { }
     virtual void on_write_completed() override {
         // We need to start a flush before the current one finishes, otherwise
         // we'll have a period without significant disk activity when the current
@@ -97,6 +116,43 @@ public:
         _permit = sstable_write_permit::unconditional();
     }
     virtual void on_flush_completed() override { }
+};
+
+// Handles all tasks related to sstable writing: permit management, compaction backlog updates, etc
+class database_sstable_write_monitor : public permit_monitor, public backlog_write_progress_manager {
+    sstables::shared_sstable _sst;
+    compaction_manager& _compaction_manager;
+    sstables::compaction_strategy& _compaction_strategy;
+    const sstables::writer_offset_tracker* _tracker = nullptr;
+    uint64_t _progress_seen = 0;
+public:
+    database_sstable_write_monitor(sstable_write_permit&& permit, sstables::shared_sstable sst, compaction_manager& manager, sstables::compaction_strategy& strategy)
+            : permit_monitor(std::move(permit))
+            , _sst(std::move(sst))
+            , _compaction_manager(manager)
+            , _compaction_strategy(strategy)
+    {}
+
+    virtual void on_write_started(const sstables::writer_offset_tracker& t) override {
+        _tracker = &t;
+        _compaction_strategy.get_backlog_tracker().register_partially_written_sstable(_sst, *this);
+    }
+
+    virtual void on_data_write_completed() override {
+        _progress_seen = _tracker->offset;
+        _tracker = nullptr;
+    }
+
+    void write_failed() {
+        _compaction_strategy.get_backlog_tracker().revert_charges(_sst);
+    }
+
+    virtual uint64_t written() const override {
+        if (_tracker) {
+            return _tracker->offset;
+        }
+        return _progress_seen;
+    }
 };
 
 static const std::unordered_set<sstring> system_keyspaces = {
@@ -159,6 +215,7 @@ column_family::column_family(schema_ptr schema, config config, db::commitlog* cl
     , _compaction_manager(compaction_manager)
     , _index_manager(*this)
     , _counter_cell_locks(std::make_unique<cell_locker>(_schema, cl_stats))
+    , _row_locker(_schema)
 {
     if (!_config.enable_disk_writes) {
         dblog.warn("Writes disabled, column family no durable.");
@@ -182,19 +239,6 @@ column_family::make_partition_presence_checker(lw_shared_ptr<sstables::sstable_s
         }
         return partition_presence_checker_result::definitely_doesnt_exist;
     };
-}
-
-mutation_source
-column_family::sstables_as_mutation_source() {
-    return mutation_source([this] (schema_ptr s,
-                                   const dht::partition_range& r,
-                                   const query::partition_slice& slice,
-                                   const io_priority_class& pc,
-                                   tracing::trace_state_ptr trace_state,
-                                   streamed_mutation::forwarding fwd,
-                                   mutation_reader::forwarding fwd_mr) {
-        return make_sstable_reader(std::move(s), _sstables, r, slice, pc, std::move(trace_state), fwd, fwd_mr);
-    });
 }
 
 snapshot_source
@@ -237,8 +281,8 @@ logalloc::occupancy_stats column_family::occupancy() const {
 }
 
 static
-bool belongs_to_current_shard(const streamed_mutation& m) {
-    return dht::shard_of(m.decorated_key().token()) == engine().cpu_id();
+bool belongs_to_current_shard(const dht::decorated_key& dk) {
+    return dht::shard_of(dk.token()) == engine().cpu_id();
 }
 
 // Stores ranges for all components of the same clustering key, index 0 referring to component
@@ -377,50 +421,30 @@ filter_sstable_for_reader(std::vector<sstables::shared_sstable>&& sstables, colu
 // selects readers on-demand as the read progresses through the token
 // range.
 class incremental_reader_selector : public reader_selector {
-    schema_ptr _s;
     const dht::partition_range* _pr;
     lw_shared_ptr<sstables::sstable_set> _sstables;
-    const io_priority_class& _pc;
-    const query::partition_slice& _slice;
-    reader_resource_tracker _resource_tracker;
     tracing::trace_state_ptr _trace_state;
-    streamed_mutation::forwarding _fwd;
-    mutation_reader::forwarding _fwd_mr;
     sstables::sstable_set::incremental_selector _selector;
     std::unordered_set<sstables::shared_sstable> _read_sstables;
+    sstable_reader_factory_type _fn;
 
-    mutation_reader create_reader(sstables::shared_sstable sst) {
+    flat_mutation_reader create_reader(sstables::shared_sstable sst) {
         tracing::trace(_trace_state, "Reading partition range {} from sstable {}", *_pr, seastar::value_of([&sst] { return sst->get_filename(); }));
-        // FIXME: make sstable::read_range_rows() return ::mutation_reader so that we can drop this wrapper.
-        mutation_reader reader =
-            make_mutation_reader<sstable_range_wrapping_reader>(sst, _s, *_pr, _slice, _pc, _resource_tracker, _fwd, _fwd_mr);
-        if (sst->is_shared()) {
-            reader = make_filtering_reader(std::move(reader), belongs_to_current_shard);
-        }
-        return std::move(reader);
+        return _fn(sst, *_pr);
     }
 
 public:
     explicit incremental_reader_selector(schema_ptr s,
             lw_shared_ptr<sstables::sstable_set> sstables,
             const dht::partition_range& pr,
-            const query::partition_slice& slice,
-            const io_priority_class& pc,
-            reader_resource_tracker resource_tracker,
             tracing::trace_state_ptr trace_state,
-            streamed_mutation::forwarding fwd,
-            mutation_reader::forwarding fwd_mr)
-        : _s(s)
+            sstable_reader_factory_type fn)
+        : reader_selector(s, pr.start() ? pr.start()->value() : dht::ring_position::min())
         , _pr(&pr)
         , _sstables(std::move(sstables))
-        , _pc(pc)
-        , _slice(slice)
-        , _resource_tracker(std::move(resource_tracker))
         , _trace_state(std::move(trace_state))
-        , _fwd(fwd)
-        , _fwd_mr(fwd_mr)
-        , _selector(_sstables->make_incremental_selector()) {
-        _selector_position = _pr->start() ? _pr->start()->value().token() : dht::minimum_token();
+        , _selector(_sstables->make_incremental_selector())
+        , _fn(std::move(fn)) {
 
         dblog.trace("incremental_reader_selector {}: created for range: {} with {} sstables",
                 this,
@@ -434,40 +458,46 @@ public:
     incremental_reader_selector(incremental_reader_selector&&) = delete;
     incremental_reader_selector& operator=(incremental_reader_selector&&) = delete;
 
-    virtual std::vector<mutation_reader> create_new_readers(const dht::token* const t) override {
+    virtual std::vector<flat_mutation_reader> create_new_readers(const dht::token* const t) override {
         dblog.trace("incremental_reader_selector {}: {}({})", this, __FUNCTION__, seastar::lazy_deref(t));
 
-        const auto& position = (t ? *t : _selector_position);
+        const auto& position = (t ? *t : _selector_position.token());
+        // we only pass _selector_position's token to _selector::select() when T is nullptr
+        // because it means gap between sstables, and the lower bound of the first interval
+        // after the gap is guaranteed to be inclusive.
         auto selection = _selector.select(position);
 
         if (selection.sstables.empty()) {
             // For the lower bound of the token range the _selector
             // might not return any sstables, in this case try again
             // with next_token unless it's maximum token.
-            if (!selection.next_token.is_maximum()
+            if (!selection.next_position.is_max()
                     && position == (_pr->start() ? _pr->start()->value().token() : dht::minimum_token())) {
                 dblog.trace("incremental_reader_selector {}: no sstables intersect with the lower bound, retrying", this);
-                _selector_position = std::move(selection.next_token);
+                _selector_position = std::move(selection.next_position);
                 return create_new_readers(nullptr);
             }
 
-            _selector_position = dht::maximum_token();
+            _selector_position = dht::ring_position::max();
             return {};
         }
 
-        _selector_position = std::move(selection.next_token);
+        _selector_position = std::move(selection.next_position);
 
         dblog.trace("incremental_reader_selector {}: {} new sstables to consider, advancing selector to {}", this, selection.sstables.size(), _selector_position);
 
-        return boost::copy_range<std::vector<mutation_reader>>(selection.sstables
+        return boost::copy_range<std::vector<flat_mutation_reader>>(selection.sstables
                 | boost::adaptors::filtered([this] (auto& sst) { return _read_sstables.emplace(sst).second; })
-                | boost::adaptors::transformed([this] (auto& sst) { return this->create_reader(sst); }));
+                | boost::adaptors::transformed([this] (auto& sst) {
+                    return this->create_reader(sst);
+                }));
     }
 
-    virtual std::vector<mutation_reader> fast_forward_to(const dht::partition_range& pr) override {
+    virtual std::vector<flat_mutation_reader> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
         _pr = &pr;
 
-        if (_pr->start()->value().token() >= _selector_position) {
+        dht::ring_position_comparator cmp(*_s);
+        if (cmp(dht::ring_position_view::for_range_start(*_pr), _selector_position) >= 0) {
             return create_new_readers(&_pr->start()->value().token());
         }
 
@@ -475,71 +505,35 @@ public:
     }
 };
 
-class single_key_sstable_reader final : public mutation_reader::impl {
-    column_family* _cf;
-    schema_ptr _schema;
-    const dht::partition_range& _pr;
-    sstables::key _key;
-    std::vector<streamed_mutation> _mutations;
-    bool _done = false;
-    lw_shared_ptr<sstables::sstable_set> _sstables;
-    utils::estimated_histogram& _sstable_histogram;
-    // Use a pointer instead of copying, so we don't need to regenerate the reader if
-    // the priority changes.
-    const io_priority_class& _pc;
-    const query::partition_slice& _slice;
-    reader_resource_tracker _resource_tracker;
-    tracing::trace_state_ptr _trace_state;
-    streamed_mutation::forwarding _fwd;
-public:
-    single_key_sstable_reader(column_family* cf,
-                              schema_ptr schema,
-                              lw_shared_ptr<sstables::sstable_set> sstables,
-                              utils::estimated_histogram& sstable_histogram,
-                              const dht::partition_range& pr, // must be singular
-                              const query::partition_slice& slice,
-                              const io_priority_class& pc,
-                              reader_resource_tracker resource_tracker,
-                              tracing::trace_state_ptr trace_state,
-                              streamed_mutation::forwarding fwd)
-        : _cf(cf)
-        , _schema(std::move(schema))
-        , _pr(pr)
-        , _key(sstables::key::from_partition_key(*_schema, *pr.start()->value().key()))
-        , _sstables(std::move(sstables))
-        , _sstable_histogram(sstable_histogram)
-        , _pc(pc)
-        , _slice(slice)
-        , _resource_tracker(std::move(resource_tracker))
-        , _trace_state(std::move(trace_state))
-        , _fwd(fwd)
-    { }
-
-    virtual future<streamed_mutation_opt> operator()() override {
-        if (_done) {
-            return make_ready_future<streamed_mutation_opt>();
-        }
-        auto candidates = filter_sstable_for_reader(_sstables->select(_pr), *_cf, _schema, _key, _slice);
-        return parallel_for_each(std::move(candidates),
-            [this](const sstables::shared_sstable& sstable) {
-                tracing::trace(_trace_state, "Reading key {} from sstable {}", _pr, seastar::value_of([&sstable] { return sstable->get_filename(); }));
-                return sstable->read_row(_schema, _pr.start()->value(), _slice, _pc, _resource_tracker, _fwd).then([this](auto smo) {
-                    if (smo) {
-                        _mutations.emplace_back(std::move(*smo));
-                    }
-                });
-        }).then([this] () -> streamed_mutation_opt {
-            _done = true;
-            if (_mutations.empty()) {
-                return { };
-            }
-            _sstable_histogram.add(_mutations.size());
-            return merge_mutations(std::move(_mutations));
-        });
+static flat_mutation_reader
+create_single_key_sstable_reader(column_family* cf,
+                                 schema_ptr schema,
+                                 lw_shared_ptr<sstables::sstable_set> sstables,
+                                 utils::estimated_histogram& sstable_histogram,
+                                 const dht::partition_range& pr, // must be singular
+                                 const query::partition_slice& slice,
+                                 const io_priority_class& pc,
+                                 reader_resource_tracker resource_tracker,
+                                 tracing::trace_state_ptr trace_state,
+                                 streamed_mutation::forwarding fwd,
+                                 mutation_reader::forwarding fwd_mr)
+{
+    auto key = sstables::key::from_partition_key(*schema, *pr.start()->value().key());
+    auto readers = boost::copy_range<std::vector<flat_mutation_reader>>(
+        filter_sstable_for_reader(sstables->select(pr), *cf, schema, key, slice)
+        | boost::adaptors::transformed([&] (const sstables::shared_sstable& sstable) {
+            tracing::trace(trace_state, "Reading key {} from sstable {}", pr, seastar::value_of([&sstable] { return sstable->get_filename(); }));
+            return sstable->read_row_flat(schema, pr.start()->value(), slice, pc, resource_tracker, fwd);
+        })
+    );
+    if (readers.empty()) {
+        return make_empty_flat_reader(schema);
     }
-};
+    sstable_histogram.add(readers.size());
+    return make_combined_reader(schema, std::move(readers), fwd, fwd_mr);
+}
 
-mutation_reader
+flat_mutation_reader
 column_family::make_sstable_reader(schema_ptr s,
                                    lw_shared_ptr<sstables::sstable_set> sstables,
                                    const dht::partition_range& pr,
@@ -548,9 +542,9 @@ column_family::make_sstable_reader(schema_ptr s,
                                    tracing::trace_state_ptr trace_state,
                                    streamed_mutation::forwarding fwd,
                                    mutation_reader::forwarding fwd_mr) const {
-    auto& config = service::get_local_streaming_read_priority().id() == pc.id()
-        ? _config.streaming_read_concurrency_config
-        : _config.read_concurrency_config;
+    auto* semaphore = service::get_local_streaming_read_priority().id() == pc.id()
+        ? _config.streaming_read_concurrency_semaphore
+        : _config.read_concurrency_semaphore;
 
     // CAVEAT: if make_sstable_reader() is called on a single partition
     // we want to optimize and read exactly this partition. As a
@@ -559,47 +553,45 @@ column_family::make_sstable_reader(schema_ptr s,
     if (pr.is_singular() && pr.start()->value().has_key()) {
         const dht::ring_position& pos = pr.start()->value();
         if (dht::shard_of(pos.token()) != engine().cpu_id()) {
-            return make_empty_reader(); // range doesn't belong to this shard
+            return make_empty_flat_reader(s); // range doesn't belong to this shard
         }
 
-        if (config.resources_sem) {
-            auto ms = mutation_source([&config, sstables=std::move(sstables), this] (
+        if (semaphore) {
+            auto ms = mutation_source([semaphore, this, sstables=std::move(sstables)] (
                         schema_ptr s,
                         const dht::partition_range& pr,
                         const query::partition_slice& slice,
                         const io_priority_class& pc,
                         tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
-                        mutation_reader::forwarding fwd_mr) {
-                    return make_mutation_reader<single_key_sstable_reader>(const_cast<column_family*>(this), std::move(s), std::move(sstables),
-                                _stats.estimated_sstable_per_read, pr, slice, pc, reader_resource_tracker(config.resources_sem), std::move(trace_state), fwd);
+                        mutation_reader::forwarding fwd_mr,
+                        reader_resource_tracker tracker) {
+                    return create_single_key_sstable_reader(const_cast<column_family*>(this), std::move(s), std::move(sstables),
+                                _stats.estimated_sstable_per_read, pr, slice, pc, tracker, std::move(trace_state), fwd, fwd_mr);
                 });
-            return make_restricted_reader(config, std::move(ms), std::move(s), pr, slice, pc, std::move(trace_state), fwd, fwd_mr);
+            return make_restricted_flat_reader(*semaphore, std::move(ms), std::move(s), pr, slice, pc, std::move(trace_state), fwd, fwd_mr);
         } else {
-            return make_mutation_reader<single_key_sstable_reader>(const_cast<column_family*>(this), std::move(s), std::move(sstables),
-                        _stats.estimated_sstable_per_read, pr, slice, pc, no_resource_tracking(), std::move(trace_state), fwd);
+            return create_single_key_sstable_reader(const_cast<column_family*>(this), std::move(s), std::move(sstables),
+                        _stats.estimated_sstable_per_read, pr, slice, pc, no_resource_tracking(), std::move(trace_state), fwd, fwd_mr);
         }
     } else {
-        if (config.resources_sem) {
-            auto ms = mutation_source([&config, sstables=std::move(sstables)] (
+        if (semaphore) {
+            auto ms = mutation_source([semaphore, sstables=std::move(sstables)] (
                         schema_ptr s,
                         const dht::partition_range& pr,
                         const query::partition_slice& slice,
                         const io_priority_class& pc,
                         tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
-                        mutation_reader::forwarding fwd_mr) {
-                    return make_mutation_reader<combined_mutation_reader>(
-                            std::make_unique<incremental_reader_selector>(std::move(s), std::move(sstables), pr, slice, pc,
-                                    reader_resource_tracker(config.resources_sem), std::move(trace_state), fwd, fwd_mr),
-                            fwd_mr);
+                        mutation_reader::forwarding fwd_mr,
+                        reader_resource_tracker tracker) {
+                    return make_local_shard_sstable_reader(std::move(s), std::move(sstables), pr, slice, pc,
+                        tracker, std::move(trace_state), fwd, fwd_mr);
                 });
-            return make_restricted_reader(config, std::move(ms), std::move(s), pr, slice, pc, std::move(trace_state), fwd, fwd_mr);
+            return make_restricted_flat_reader(*semaphore, std::move(ms), std::move(s), pr, slice, pc, std::move(trace_state), fwd, fwd_mr);
         } else {
-            return make_mutation_reader<combined_mutation_reader>(
-                    std::make_unique<incremental_reader_selector>(std::move(s), std::move(sstables), pr, slice, pc,
-                            no_resource_tracking(), std::move(trace_state), fwd, fwd_mr),
-                    fwd_mr);
+            return make_local_shard_sstable_reader(std::move(s), std::move(sstables), pr, slice, pc,
+                no_resource_tracking(), std::move(trace_state), fwd, fwd_mr);
         }
     }
 }
@@ -608,10 +600,8 @@ column_family::make_sstable_reader(schema_ptr s,
 future<column_family::const_mutation_partition_ptr>
 column_family::find_partition(schema_ptr s, const dht::decorated_key& key) const {
     return do_with(dht::partition_range::make_singular(key), [s = std::move(s), this] (auto& range) {
-        return do_with(this->make_reader(s, range), [] (mutation_reader& reader) {
-            return reader().then([] (auto sm) {
-                return mutation_from_streamed_mutation(std::move(sm));
-            }).then([] (mutation_opt&& mo) -> std::unique_ptr<const mutation_partition> {
+        return do_with(this->make_reader(s, range), [s] (flat_mutation_reader& reader) {
+            return read_mutation_from_flat_mutation_reader(reader).then([] (mutation_opt&& mo) -> std::unique_ptr<const mutation_partition> {
                 if (!mo) {
                     return {};
                 }
@@ -642,7 +632,7 @@ column_family::find_row(schema_ptr s, const dht::decorated_key& partition_key, c
     });
 }
 
-mutation_reader
+flat_mutation_reader
 column_family::make_reader(schema_ptr s,
                            const dht::partition_range& range,
                            const query::partition_slice& slice,
@@ -651,10 +641,10 @@ column_family::make_reader(schema_ptr s,
                            streamed_mutation::forwarding fwd,
                            mutation_reader::forwarding fwd_mr) const {
     if (_virtual_reader) {
-        return (*_virtual_reader)(s, range, slice, pc, trace_state, fwd, fwd_mr);
+        return (*_virtual_reader).make_reader(s, range, slice, pc, trace_state, fwd, fwd_mr);
     }
 
-    std::vector<mutation_reader> readers;
+    std::vector<flat_mutation_reader> readers;
     readers.reserve(_memtables->size() + 1);
 
     // We're assuming that cache and memtables are both read atomically
@@ -678,7 +668,7 @@ column_family::make_reader(schema_ptr s,
     // https://github.com/scylladb/scylla/issues/185
 
     for (auto&& mt : *_memtables) {
-        readers.emplace_back(mt->make_reader(s, range, slice, pc, trace_state, fwd, fwd_mr));
+        readers.emplace_back(mt->make_flat_reader(s, range, slice, pc, trace_state, fwd, fwd_mr));
     }
 
     if (_config.enable_cache) {
@@ -687,28 +677,10 @@ column_family::make_reader(schema_ptr s,
         readers.emplace_back(make_sstable_reader(s, _sstables, range, slice, pc, std::move(trace_state), fwd, fwd_mr));
     }
 
-    return make_combined_reader(std::move(readers), fwd_mr);
+    return make_combined_reader(s, std::move(readers), fwd, fwd_mr);
 }
 
-mutation_reader
-column_family::make_streaming_reader(schema_ptr s,
-                           const dht::partition_range& range) const {
-    auto& slice = s->full_slice();
-    auto& pc = service::get_local_streaming_read_priority();
-
-    std::vector<mutation_reader> readers;
-    readers.reserve(_memtables->size() + 1);
-
-    for (auto&& mt : *_memtables) {
-        readers.emplace_back(mt->make_reader(s, range, slice, pc, nullptr, streamed_mutation::forwarding::no, mutation_reader::forwarding::no));
-    }
-
-    readers.emplace_back(make_sstable_reader(s, _sstables, range, slice, pc, nullptr, streamed_mutation::forwarding::no, mutation_reader::forwarding::no));
-
-    return make_combined_reader(std::move(readers), mutation_reader::forwarding::no);
-}
-
-mutation_reader
+flat_mutation_reader
 column_family::make_streaming_reader(schema_ptr s,
                            const dht::partition_range_vector& ranges) const {
     auto& slice = s->full_slice();
@@ -716,19 +688,19 @@ column_family::make_streaming_reader(schema_ptr s,
 
     auto source = mutation_source([this] (schema_ptr s, const dht::partition_range& range, const query::partition_slice& slice,
                                       const io_priority_class& pc, tracing::trace_state_ptr trace_state, streamed_mutation::forwarding fwd, mutation_reader::forwarding fwd_mr) {
-        std::vector<mutation_reader> readers;
+        std::vector<flat_mutation_reader> readers;
         readers.reserve(_memtables->size() + 1);
         for (auto&& mt : *_memtables) {
-            readers.emplace_back(mt->make_reader(s, range, slice, pc, trace_state, fwd, fwd_mr));
+            readers.emplace_back(mt->make_flat_reader(s, range, slice, pc, trace_state, fwd, fwd_mr));
         }
         readers.emplace_back(make_sstable_reader(s, _sstables, range, slice, pc, std::move(trace_state), fwd, fwd_mr));
-        return make_combined_reader(std::move(readers), fwd_mr);
+        return make_combined_reader(s, std::move(readers), fwd, fwd_mr);
     });
 
-    return make_multi_range_reader(s, std::move(source), ranges, slice, pc, nullptr, streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
+    return make_flat_multi_range_reader(s, std::move(source), ranges, slice, pc, nullptr, mutation_reader::forwarding::no);
 }
 
-future<std::vector<locked_cell>> column_family::lock_counter_cells(const mutation& m, timeout_clock::time_point timeout) {
+future<std::vector<locked_cell>> column_family::lock_counter_cells(const mutation& m, db::timeout_clock::time_point timeout) {
     assert(m.schema() == _counter_cell_locks->schema());
     return _counter_cell_locks->lock_cells(m.decorated_key(), partition_cells_range(m.partition()), timeout);
 }
@@ -741,7 +713,7 @@ column_family::for_all_partitions(schema_ptr s, Func&& func) const {
                   "bad Func signature");
 
     struct iteration_state {
-        mutation_reader reader;
+        flat_mutation_reader reader;
         Func func;
         bool ok = true;
         bool empty = false;
@@ -755,9 +727,7 @@ column_family::for_all_partitions(schema_ptr s, Func&& func) const {
 
     return do_with(iteration_state(std::move(s), *this, std::move(func)), [] (iteration_state& is) {
         return do_until([&is] { return is.done(); }, [&is] {
-            return is.reader().then([] (auto sm) {
-                return mutation_from_streamed_mutation(std::move(sm));
-            }).then([&is](mutation_opt&& mo) {
+            return read_mutation_from_flat_mutation_reader(is.reader).then([&is](mutation_opt&& mo) {
                 if (!mo) {
                     is.empty = true;
                 } else {
@@ -789,7 +759,6 @@ column_family::open_sstable(sstables::foreign_sstable_open_info info, sstring di
     auto sst = sstables::make_sstable(_schema, dir, generation, v, f);
     if (!belongs_to_current_shard(info.owners)) {
         dblog.debug("sstable {} not relevant for this shard, ignoring", sst->get_filename());
-        sst->mark_for_deletion();
         return make_ready_future<sstables::shared_sstable>();
     }
     return sst->load(std::move(info)).then([sst] () mutable {
@@ -839,6 +808,7 @@ void column_family::add_sstable(sstables::shared_sstable sstable, const std::vec
     new_sstables->insert(sstable);
     _sstables = std::move(new_sstables);
     update_stats_for_new_sstable(sstable->bytes_on_disk(), shards_for_the_sstable);
+    _compaction_strategy.get_backlog_tracker().add_sstable(sstable);
 }
 
 future<>
@@ -887,6 +857,7 @@ column_family::seal_active_streaming_memtable_delayed() {
 
 future<>
 column_family::seal_active_streaming_memtable_immediate(flush_permit&& permit) {
+  return with_scheduling_group(_config.streaming_scheduling_group, [this, permit = std::move(permit)] () mutable {
     auto old = _streaming_memtables->back();
     if (old->empty()) {
         return make_ready_future<>();
@@ -905,14 +876,13 @@ column_family::seal_active_streaming_memtable_immediate(flush_permit&& permit) {
         with_lock(_sstables_lock.for_read(), [this, old, permit = std::move(permit)] () mutable {
             auto newtab = sstables::make_sstable(_schema,
                 _config.datadir, calculate_generation_for_new_table(),
-                sstables::sstable::version_types::ka,
+                get_highest_supported_format(),
                 sstables::sstable::format_types::big);
 
             newtab->set_unshared();
 
             dblog.debug("Flushing to {}", newtab->get_filename());
 
-            auto&& priority = service::get_local_streaming_write_priority();
             // This is somewhat similar to the main memtable flush, but with important differences.
             //
             // The first difference, is that we don't keep aggregate collectd statistics about this one.
@@ -921,24 +891,32 @@ column_family::seal_active_streaming_memtable_immediate(flush_permit&& permit) {
             //
             // Lastly, we don't have any commitlog RP to update, and we don't need to deal manipulate the
             // memtable list, since this memtable was not available for reading up until this point.
-            auto monitor = seastar::make_shared<permit_monitor>(permit.release_sstable_write_permit());
-            return write_memtable_to_sstable(*old, newtab, std::move(monitor), incremental_backups_enabled(), priority, false, _config.background_writer_scheduling_group).then([this, newtab, old] {
-                return newtab->open_data();
-            }).then([this, old, newtab] () {
-                auto adder = [this, newtab] {
-                    add_sstable(newtab, {engine().cpu_id()});
-                    try_trigger_compaction();
-                    dblog.debug("Flushing to {} done", newtab->get_filename());
-                };
-                if (_config.enable_cache) {
-                    return _cache.update_invalidating(adder, *old);
-                } else {
-                    adder();
-                    return old->clear_gently();
-                }
-            }).handle_exception([old, permit = std::move(permit)] (auto ep) {
-                dblog.error("failed to write streamed sstable: {}", ep);
-                return make_exception_future<>(ep);
+            auto fp = permit.release_sstable_write_permit();
+            database_sstable_write_monitor monitor(std::move(fp), newtab, _compaction_manager, _compaction_strategy);
+            return do_with(std::move(monitor), [this, newtab, old, permit = std::move(permit)] (auto& monitor) mutable {
+                auto&& priority = service::get_local_streaming_write_priority();
+                return write_memtable_to_sstable(*old, newtab, monitor, incremental_backups_enabled(), priority, false).then([this, newtab, old] {
+                    return newtab->open_data();
+                }).then([this, old, newtab] () {
+                    return with_scheduling_group(_config.memtable_to_cache_scheduling_group, [this, newtab, old] {
+                      auto adder = [this, newtab] {
+                          add_sstable(newtab, {engine().cpu_id()});
+                          try_trigger_compaction();
+                          dblog.debug("Flushing to {} done", newtab->get_filename());
+                      };
+                      if (_config.enable_cache) {
+                        return _cache.update_invalidating(adder, *old);
+                      } else {
+                        adder();
+                        return old->clear_gently();
+                      }
+                    });
+                }).handle_exception([old, permit = std::move(permit), &monitor, newtab] (auto ep) {
+                    monitor.write_failed();
+                    newtab->mark_for_deletion();
+                    dblog.error("failed to write streamed sstable: {}", ep);
+                    return make_exception_future<>(ep);
+                });
             });
             // We will also not have any retry logic. If we fail here, we'll fail the streaming and let
             // the upper layers know. They can then apply any logic they want here.
@@ -952,9 +930,11 @@ column_family::seal_active_streaming_memtable_immediate(flush_permit&& permit) {
 
         return f;
     }).finally([guard = std::move(guard)] { });
+  });
 }
 
 future<> column_family::seal_active_streaming_memtable_big(streaming_memtable_big& smb, flush_permit&& permit) {
+  return with_scheduling_group(_config.streaming_scheduling_group, [this, &smb, permit = std::move(permit)] () mutable {
     auto old = smb.memtables->back();
     if (old->empty()) {
         return make_ready_future<>();
@@ -965,23 +945,32 @@ future<> column_family::seal_active_streaming_memtable_big(streaming_memtable_bi
         return with_gate(smb.flush_in_progress, [this, old, &smb, permit = std::move(permit)] () mutable {
             return with_lock(_sstables_lock.for_read(), [this, old, &smb, permit = std::move(permit)] () mutable {
                 auto newtab = sstables::make_sstable(_schema,
-                                                                _config.datadir, calculate_generation_for_new_table(),
-                                                                sstables::sstable::version_types::ka,
-                                                                sstables::sstable::format_types::big);
+                                                     _config.datadir, calculate_generation_for_new_table(),
+                                                     get_highest_supported_format(),
+                                                     sstables::sstable::format_types::big);
 
                 newtab->set_unshared();
 
+                auto fp = permit.release_sstable_write_permit();
+                auto monitor = std::make_unique<database_sstable_write_monitor>(std::move(fp), newtab, _compaction_manager, _compaction_strategy);
                 auto&& priority = service::get_local_streaming_write_priority();
-                auto monitor = seastar::make_shared<permit_monitor>(permit.release_sstable_write_permit());
-                return write_memtable_to_sstable(*old, newtab, std::move(monitor), incremental_backups_enabled(), priority, true, _config.background_writer_scheduling_group).then([this, newtab, old, &smb, permit = std::move(permit)] {
-                    smb.sstables.emplace_back(newtab);
-                }).handle_exception([] (auto ep) {
-                    dblog.error("failed to write streamed sstable: {}", ep);
-                    return make_exception_future<>(ep);
+                auto fut = write_memtable_to_sstable(*old, newtab, *monitor, incremental_backups_enabled(), priority, true);
+                return fut.then_wrapped([this, newtab, old, &smb, permit = std::move(permit), monitor = std::move(monitor)] (future<> f) mutable {
+                    if (!f.failed()) {
+                        smb.sstables.push_back(monitored_sstable{std::move(monitor), newtab});
+                        return make_ready_future<>();
+                    } else {
+                        monitor->write_failed();
+                        newtab->mark_for_deletion();
+                        auto ep = f.get_exception();
+                        dblog.error("failed to write streamed sstable: {}", ep);
+                        return make_exception_future<>(ep);
+                    }
                 });
             });
         });
     });
+  });
 }
 
 future<>
@@ -1037,11 +1026,12 @@ column_family::seal_active_memtable(flush_permit&& permit) {
 
 future<stop_iteration>
 column_family::try_flush_memtable_to_sstable(lw_shared_ptr<memtable> old, sstable_write_permit&& permit) {
+  return with_scheduling_group(_config.memtable_scheduling_group, [this, old = std::move(old), permit = std::move(permit)] () mutable {
     auto gen = calculate_generation_for_new_table();
 
     auto newtab = sstables::make_sstable(_schema,
         _config.datadir, gen,
-        sstables::sstable::version_types::ka,
+        get_highest_supported_format(),
         sstables::sstable::format_types::big);
 
     newtab->set_unshared();
@@ -1057,25 +1047,36 @@ column_family::try_flush_memtable_to_sstable(lw_shared_ptr<memtable> old, sstabl
     //
     // The code as is guarantees that we'll never partially backup a
     // single sstable, so that is enough of a guarantee.
-    auto&& priority = service::get_local_memtable_flush_priority();
-    auto monitor = seastar::make_shared<permit_monitor>(std::move(permit));
-    return write_memtable_to_sstable(*old, newtab, std::move(monitor), incremental_backups_enabled(), priority, false, _config.memtable_scheduling_group).then([this, newtab, old] {
-        return newtab->open_data();
-    }).then([this, old, newtab] () {
-        dblog.debug("Flushing to {} done", newtab->get_filename());
-        return update_cache(old, newtab);
-    }).then([this, old, newtab] () noexcept {
-        _memtables->erase(old);
-        dblog.debug("Memtable for {} replaced", newtab->get_filename());
-        return stop_iteration::yes;
-    }).handle_exception([this, old, newtab] (auto e) {
-        newtab->mark_for_deletion();
-        dblog.error("failed to write sstable {}: {}", newtab->get_filename(), e);
-        // If we failed this write we will try the write again and that will create a new flush reader
-        // that will decrease dirty memory again. So we need to reset the accounting.
-        old->revert_flushed_memory();
-        return stop_iteration::no;
+    database_sstable_write_monitor monitor(std::move(permit), newtab, _compaction_manager, _compaction_strategy);
+    return do_with(std::move(monitor), [this, old, newtab] (auto& monitor) {
+        auto&& priority = service::get_local_memtable_flush_priority();
+        return write_memtable_to_sstable(*old, newtab, monitor, incremental_backups_enabled(), priority, false).then([this, newtab, old, &monitor] {
+         // Switch back to default scheduling group for post-flush actions, to avoid them being staved by the memtable flush
+         // controller. Cache update does not affect the input of the memtable cpu controller, so it can be subject to
+         // priority inversion.
+         return with_scheduling_group(default_scheduling_group(), [this, &monitor, old = std::move(old), newtab = std::move(newtab)] () mutable {
+          return newtab->open_data().then([this, old, newtab] () {
+            dblog.debug("Flushing to {} done", newtab->get_filename());
+            return with_scheduling_group(_config.memtable_to_cache_scheduling_group, [this, old, newtab] {
+                return update_cache(old, newtab);
+            });
+          }).then([this, old, newtab] () noexcept {
+            _memtables->erase(old);
+            dblog.debug("Memtable for {} replaced", newtab->get_filename());
+            return stop_iteration::yes;
+          }).handle_exception([this, old, newtab, &monitor] (auto e) {
+            monitor.write_failed();
+            newtab->mark_for_deletion();
+            dblog.error("failed to write sstable {}: {}", newtab->get_filename(), e);
+            // If we failed this write we will try the write again and that will create a new flush reader
+            // that will decrease dirty memory again. So we need to reset the accounting.
+            old->revert_flushed_memory();
+            return stop_iteration::no;
+          });
+         });
+        });
     });
+  });
 }
 
 void
@@ -1125,7 +1126,7 @@ distributed_loader::flush_upload_dir(distributed<database>& db, sstring ks_name,
 
         return lister::scan_dir(lister::path(cf._config.datadir) / "upload", { directory_entry_type::regular },
                 [&work] (lister::path parent_dir, directory_entry de) {
-            auto comps = sstables::entry_descriptor::make_descriptor(de.name);
+            auto comps = sstables::entry_descriptor::make_descriptor(parent_dir.native(), de.name);
             if (comps.component != sstables::sstable::component_type::TOC) {
                 return make_ready_future<>();
             }
@@ -1184,7 +1185,7 @@ column_family::reshuffle_sstables(std::set<int64_t> all_generations, int64_t sta
 
     return do_with(work(start, std::move(all_generations)), [this] (work& work) {
         return lister::scan_dir(_config.datadir, { directory_entry_type::regular }, [this, &work] (lister::path parent_dir, directory_entry de) {
-            auto comps = sstables::entry_descriptor::make_descriptor(de.name);
+            auto comps = sstables::entry_descriptor::make_descriptor(parent_dir.native(), de.name);
             if (comps.component != sstables::sstable::component_type::TOC) {
                 return make_ready_future<>();
             }
@@ -1269,6 +1270,25 @@ void column_family::rebuild_statistics() {
 
 void
 column_family::rebuild_sstable_list(const std::vector<sstables::shared_sstable>& new_sstables,
+                                    const std::vector<sstables::shared_sstable>& old_sstables) {
+    auto current_sstables = _sstables;
+    auto new_sstable_list = _compaction_strategy.make_sstable_set(_schema);
+
+    std::unordered_set<sstables::shared_sstable> s(old_sstables.begin(), old_sstables.end());
+
+    // this might seem dangerous, but "move" here just avoids constness,
+    // making the two ranges compatible when compiling with boost 1.55.
+    // Noone is actually moving anything...
+    for (auto&& tab : boost::range::join(new_sstables, std::move(*current_sstables->all()))) {
+        if (!s.count(tab)) {
+            new_sstable_list.insert(tab);
+        }
+    }
+    _sstables = make_lw_shared(std::move(new_sstable_list));
+}
+
+void
+column_family::on_compaction_completion(const std::vector<sstables::shared_sstable>& new_sstables,
                                     const std::vector<sstables::shared_sstable>& sstables_to_remove) {
     // Build a new list of _sstables: We remove from the existing list the
     // tables we compacted (by now, there might be more sstables flushed
@@ -1280,34 +1300,31 @@ column_family::rebuild_sstable_list(const std::vector<sstables::shared_sstable>&
     // to avoid a new compaction from ignoring data in the old sstables
     // if the deletion fails (note deletion of shared sstables can take
     // unbounded time, because all shards must agree on the deletion).
-    auto current_sstables = _sstables;
-    auto new_sstable_list = _compaction_strategy.make_sstable_set(_schema);
-    auto new_compacted_but_not_deleted = _sstables_compacted_but_not_deleted;
 
-
-    std::unordered_set<sstables::shared_sstable> s(
-           sstables_to_remove.begin(), sstables_to_remove.end());
-
-    // First, add the new sstables.
-
-    // this might seem dangerous, but "move" here just avoids constness,
-    // making the two ranges compatible when compiling with boost 1.55.
-    // Noone is actually moving anything...
-    for (auto&& tab : boost::range::join(new_sstables, std::move(*current_sstables->all()))) {
-        // Checks if oldtab is a sstable not being compacted.
-        if (!s.count(tab)) {
-            new_sstable_list.insert(tab);
-        } else {
-            new_compacted_but_not_deleted.push_back(tab);
+    // make sure all old sstables belong *ONLY* to current shard before we proceed to their deletion.
+    for (auto& sst : sstables_to_remove) {
+        auto shards = sst->get_shards_for_this_sstable();
+        if (shards.size() > 1) {
+            throw std::runtime_error(sprint("A regular compaction for %s.%s INCORRECTLY used shared sstable %s. Only resharding work with those!",
+                _schema->ks_name(), _schema->cf_name(), sst->toc_filename()));
+        }
+        if (!belongs_to_current_shard(shards)) {
+            throw std::runtime_error(sprint("A regular compaction for %s.%s INCORRECTLY used sstable %s which doesn't belong to this shard!",
+                _schema->ks_name(), _schema->cf_name(), sst->toc_filename()));
         }
     }
-    _sstables = make_lw_shared(std::move(new_sstable_list));
+
+    auto new_compacted_but_not_deleted = _sstables_compacted_but_not_deleted;
+    // rebuilding _sstables_compacted_but_not_deleted first to make the entire rebuild operation exception safe.
+    new_compacted_but_not_deleted.insert(new_compacted_but_not_deleted.end(), sstables_to_remove.begin(), sstables_to_remove.end());
+
+    rebuild_sstable_list(new_sstables, sstables_to_remove);
+
     _sstables_compacted_but_not_deleted = std::move(new_compacted_but_not_deleted);
 
     rebuild_statistics();
 
-    // Second, delete the old sstables.  This is done in the background, so we can
-    // consider this compaction completed.
+    // This is done in the background, so we can consider this compaction completed.
     seastar::with_gate(_sstable_deletion_gate, [this, sstables_to_remove] {
         return sstables::delete_atomically(sstables_to_remove).then_wrapped([this, sstables_to_remove] (future<> f) {
             std::exception_ptr eptr;
@@ -1332,12 +1349,6 @@ column_family::rebuild_sstable_list(const std::vector<sstables::shared_sstable>&
                 return make_exception_future<>(eptr);
             }
             return make_ready_future<>();
-        }).handle_exception([] (std::exception_ptr e) {
-            try {
-                std::rethrow_exception(e);
-            } catch (sstables::atomic_deletion_cancelled& adc) {
-                dblog.debug("Failed to delete sstables after compaction: {}", adc);
-            }
         }).then([this] {
             // refresh underlying data source in row cache to prevent it from holding reference
             // to sstables files which were previously deleted.
@@ -1346,6 +1357,9 @@ column_family::rebuild_sstable_list(const std::vector<sstables::shared_sstable>&
     });
 }
 
+// For replace/remove_ancestors_needed_write, note that we need to update the compaction backlog
+// manually. The new tables will be coming from a remote shard and thus unaccounted for in our
+// list so far, and the removed ones will no longer be needed by us.
 void column_family::replace_ancestors_needed_rewrite(std::vector<sstables::shared_sstable> new_sstables) {
     std::vector<sstables::shared_sstable> old_sstables;
     std::unordered_set<uint64_t> ancestors;
@@ -1353,16 +1367,19 @@ void column_family::replace_ancestors_needed_rewrite(std::vector<sstables::share
     for (auto& sst : new_sstables) {
         auto sst_ancestors = sst->ancestors();
         ancestors.insert(sst_ancestors.begin(), sst_ancestors.end());
+        _compaction_strategy.get_backlog_tracker().add_sstable(sst);
     }
 
     for (auto& ancestor : ancestors) {
         auto it = _sstables_need_rewrite.find(ancestor);
         if (it != _sstables_need_rewrite.end()) {
             old_sstables.push_back(it->second);
+            _compaction_strategy.get_backlog_tracker().remove_sstable(it->second);
             _sstables_need_rewrite.erase(it);
         }
     }
     rebuild_sstable_list(new_sstables, old_sstables);
+    rebuild_statistics();
 }
 
 void column_family::remove_ancestors_needed_rewrite(std::unordered_set<uint64_t> ancestors) {
@@ -1371,10 +1388,12 @@ void column_family::remove_ancestors_needed_rewrite(std::unordered_set<uint64_t>
         auto it = _sstables_need_rewrite.find(ancestor);
         if (it != _sstables_need_rewrite.end()) {
             old_sstables.push_back(it->second);
+            _compaction_strategy.get_backlog_tracker().remove_sstable(it->second);
             _sstables_need_rewrite.erase(it);
         }
     }
     rebuild_sstable_list({}, old_sstables);
+    rebuild_statistics();
 }
 
 future<>
@@ -1384,21 +1403,20 @@ column_family::compact_sstables(sstables::compaction_descriptor descriptor, bool
         return make_ready_future<>();
     }
 
-    return with_lock(_sstables_lock.for_read(), [this, descriptor = std::move(descriptor), cleanup] {
-        auto sstables_to_compact = make_lw_shared<std::vector<sstables::shared_sstable>>(std::move(descriptor.sstables));
-
+    return with_lock(_sstables_lock.for_read(), [this, descriptor = std::move(descriptor), cleanup] () mutable {
         auto create_sstable = [this] {
                 auto gen = this->calculate_generation_for_new_table();
                 auto sst = sstables::make_sstable(_schema, _config.datadir, gen,
-                        sstables::sstable::version_types::ka,
+                        get_highest_supported_format(),
                         sstables::sstable::format_types::big);
                 sst->set_unshared();
                 return sst;
         };
-        return sstables::compact_sstables(*sstables_to_compact, *this, create_sstable, descriptor.max_sstable_bytes, descriptor.level,
-                cleanup, _config.background_writer_scheduling_group).then([this, sstables_to_compact] (auto info) {
-            _compaction_strategy.notify_completion(*sstables_to_compact, info.new_sstables);
-            this->rebuild_sstable_list(info.new_sstables, *sstables_to_compact);
+        auto sstables_to_compact = descriptor.sstables;
+        return sstables::compact_sstables(std::move(descriptor), *this, create_sstable,
+                cleanup).then([this, sstables_to_compact = std::move(sstables_to_compact)] (auto info) {
+            _compaction_strategy.notify_completion(sstables_to_compact, info.new_sstables);
+            this->on_compaction_completion(info.new_sstables, sstables_to_compact);
             return info;
         });
     }).then([this] (auto info) {
@@ -1495,10 +1513,21 @@ future<> column_family::run_compaction(sstables::compaction_descriptor descripto
 void column_family::set_compaction_strategy(sstables::compaction_strategy_type strategy) {
     dblog.info0("Setting compaction strategy of {}.{} to {}", _schema->ks_name(), _schema->cf_name(), sstables::compaction_strategy::name(strategy));
     auto new_cs = make_compaction_strategy(strategy, _schema->compaction_strategy_options());
+
+    _compaction_manager.register_backlog_tracker(new_cs.get_backlog_tracker());
+    auto move_read_charges = new_cs.type() == _compaction_strategy.type();
+    _compaction_strategy.get_backlog_tracker().transfer_ongoing_charges(new_cs.get_backlog_tracker(), move_read_charges);
+
     auto new_sstables = new_cs.make_sstable_set(_schema);
     for (auto&& s : *_sstables->all()) {
+        new_cs.get_backlog_tracker().add_sstable(s);
         new_sstables.insert(s);
     }
+
+    if (!move_read_charges) {
+        _compaction_manager.stop_tracking_ongoing_compactions(this);
+    }
+
     // now exception safe:
     _compaction_strategy = std::move(new_cs);
     _sstables = std::move(new_sstables);
@@ -1582,8 +1611,8 @@ inline bool column_family::manifest_json_filter(const lister::path&, const direc
 
 // TODO: possibly move it to seastar
 template <typename Service, typename PtrType, typename Func>
-static future<> invoke_all_with_ptr(distributed<Service>& s, PtrType ptr, Func&& func) {
-    return parallel_for_each(smp::all_cpus(), [&s, &func, ptr] (unsigned id) {
+static future<> invoke_shards_with_ptr(std::vector<shard_id> shards, distributed<Service>& s, PtrType ptr, Func&& func) {
+    return parallel_for_each(std::move(shards), [&s, &func, ptr] (shard_id id) {
         return s.invoke_on(id, [func, foreign = make_foreign(ptr)] (Service& s) mutable {
             return func(s, std::move(foreign));
         });
@@ -1607,9 +1636,9 @@ future<> distributed_loader::open_sstable(distributed<database>& db, sstables::e
 
             auto f = sstables::sstable::load_shared_components(cf.schema(), cf._config.datadir, comps.generation, comps.version, comps.format, pc);
             return f.then([&db, comps = std::move(comps), func = std::move(func)] (sstables::sstable_open_info info) {
-                // shared components loaded, now opening sstable in all shards with shared components
+                // shared components loaded, now opening sstable in all shards that own it with shared components
                 return do_with(std::move(info), [&db, comps = std::move(comps), func = std::move(func)] (auto& info) {
-                    return invoke_all_with_ptr(db, std::move(info.components),
+                    return invoke_shards_with_ptr(info.owners, db, std::move(info.components),
                             [owners = info.owners, data = info.data.dup(), index = info.index.dup(), comps, func] (database& db, auto components) {
                         auto& cf = db.find_column_family(comps.ks, comps.cf);
                         return func(cf, sstables::foreign_sstable_open_info{std::move(components), owners, data, index});
@@ -1781,11 +1810,11 @@ void distributed_loader::reshard(distributed<database>& db, sstring ks_name, sst
                     }).get0();
 
                     auto sst = sstables::make_sstable(cf->schema(), cf->dir(), gen,
-                        sstables::sstable::version_types::ka, sstables::sstable::format_types::big,
+                        get_highest_supported_format(), sstables::sstable::format_types::big,
                         gc_clock::now(), default_io_error_handler_gen());
                     return sst;
                 };
-                auto f = sstables::reshard_sstables(sstables, *cf, creator, max_sstable_bytes, level, cf->background_writer_scheduling_group());
+                auto f = sstables::reshard_sstables(sstables, *cf, creator, max_sstable_bytes, level);
 
                 return f.then([&cf, sstables = std::move(sstables)] (std::vector<sstables::shared_sstable> new_sstables) mutable {
                     // an input sstable may belong to shard 1 and 2 and only have data which
@@ -1827,6 +1856,15 @@ void distributed_loader::reshard(distributed<database>& db, sstring ks_name, sst
                                 cf->replace_ancestors_needed_rewrite(sstables);
                             });
                         }
+                    }).then([sstables] {
+                        // schedule deletion of shared sstables after we're certain that new unshared ones were successfully forwarded to respective shards.
+                        sstables::delete_atomically(std::move(sstables)).handle_exception([op = sstables::background_jobs().start()] (std::exception_ptr eptr) {
+                            try {
+                                std::rethrow_exception(eptr);
+                            } catch (...) {
+                                dblog.warn("Exception in resharding when deleting sstable file: {}", eptr);
+                            }
+                        });
                     });
                 });
             }).get();
@@ -1869,7 +1907,7 @@ future<> distributed_loader::load_new_sstables(distributed<database>& db, sstrin
 future<sstables::entry_descriptor> distributed_loader::probe_file(distributed<database>& db, sstring sstdir, sstring fname) {
     using namespace sstables;
 
-    entry_descriptor comps = entry_descriptor::make_descriptor(fname);
+    entry_descriptor comps = entry_descriptor::make_descriptor(sstdir, fname);
 
     // Every table will have a TOC. Using a specific file as a criteria, as
     // opposed to, say verifying _sstables.count() to be zero is more robust
@@ -2036,20 +2074,29 @@ future<> distributed_loader::populate_column_family(distributed<database>& db, s
 }
 
 inline
-flush_cpu_controller
-make_flush_cpu_controller(db::config& cfg, seastar::thread_scheduling_group* backup, std::function<double()> fn) {
-    if (cfg.auto_adjust_flush_quota()) {
-        return flush_cpu_controller(250ms, cfg.virtual_dirty_soft_limit(), std::move(fn));
+flush_controller
+make_flush_controller(db::config& cfg, seastar::scheduling_group sg, const ::io_priority_class& iop, std::function<double()> fn) {
+    if (cfg.memtable_flush_static_shares() > 0) {
+        return flush_controller(sg, iop, cfg.memtable_flush_static_shares());
     }
-    return flush_cpu_controller(flush_cpu_controller::disabled{backup});
+    return flush_controller(sg, iop, 250ms, cfg.virtual_dirty_soft_limit(), std::move(fn));
+}
+
+inline
+compaction_controller
+make_compaction_controller(db::config& cfg, seastar::scheduling_group sg, const ::io_priority_class& iop, std::function<double()> fn) {
+    if (cfg.compaction_static_shares() > 0) {
+        return compaction_controller(sg, iop, cfg.compaction_static_shares());
+    }
+    return compaction_controller(sg, iop, 250ms, std::move(fn));
 }
 
 utils::UUID database::empty_version = utils::UUID_gen::get_name_UUID(bytes{});
 
-database::database() : database(db::config())
+database::database() : database(db::config(), database_config())
 {}
 
-database::database(const db::config& cfg)
+database::database(const db::config& cfg, database_config dbcfg)
     : _stats(make_lw_shared<db_stats>())
     , _cl_stats(std::make_unique<cell_locker_stats>())
     , _cfg(std::make_unique<db::config>(cfg))
@@ -2057,45 +2104,70 @@ database::database(const db::config& cfg)
     , _system_dirty_memory_manager(*this, 10 << 20, cfg.virtual_dirty_soft_limit())
     , _dirty_memory_manager(*this, memory::stats().total_memory() * 0.45, cfg.virtual_dirty_soft_limit())
     , _streaming_dirty_memory_manager(*this, memory::stats().total_memory() * 0.10, cfg.virtual_dirty_soft_limit())
-    , _background_writer_scheduling_group(1ms, _cfg->background_writer_scheduling_quota())
-    , _memtable_cpu_controller(make_flush_cpu_controller(*_cfg, &_background_writer_scheduling_group, [this, limit = 2.0f * _dirty_memory_manager.throttle_threshold()] {
+    , _dbcfg(dbcfg)
+    , _memtable_controller(make_flush_controller(*_cfg, dbcfg.memtable_scheduling_group, service::get_local_memtable_flush_priority(), [this, limit = float(_dirty_memory_manager.throttle_threshold())] {
         return (_dirty_memory_manager.virtual_dirty_memory()) / limit;
     }))
+    , _read_concurrency_sem(max_count_concurrent_reads,
+        max_memory_concurrent_reads(),
+        max_inactive_queue_length(),
+        [this] {
+            ++_stats->sstable_read_queue_overloaded;
+            return std::make_exception_ptr(std::runtime_error("sstable inactive read queue overloaded"));
+        },
+        [this] {
+            return _querier_cache.evict_one();
+        })
+    // No timeouts or queue length limits - a failure here can kill an entire repair.
+    // Trust the caller to limit concurrency.
+    , _streaming_concurrency_sem(max_count_streaming_concurrent_reads, max_memory_streaming_concurrent_reads())
+    , _system_read_concurrency_sem(max_count_system_concurrent_reads, max_memory_system_concurrent_reads())
+    , _data_query_stage("data_query", _dbcfg.statement_scheduling_group, &column_family::query)
+    , _mutation_query_stage(_dbcfg.statement_scheduling_group)
     , _version(empty_version)
-    , _compaction_manager(std::make_unique<compaction_manager>())
+    , _compaction_manager(std::make_unique<compaction_manager>(dbcfg.compaction_scheduling_group))
     , _enable_incremental_backups(cfg.incremental_backups())
+    , _compaction_controller(make_compaction_controller(*_cfg, dbcfg.compaction_scheduling_group, service::get_local_compaction_priority(), [this] () -> float {
+        auto backlog = _compaction_manager->backlog();
+        // This means we are using an unimplemented strategy
+        if (std::isinf(backlog)) {
+            // returning the normalization factor means that we'll return the maximum
+            // output in the _control_points. We can get rid of this when we implement
+            // all strategies.
+            return compaction_controller::normalization_factor;
+        }
+        return _compaction_manager->backlog() / memory::stats().total_memory();
+    }))
 {
+    local_schema_registry().init(*this); // TODO: we're never unbound.
     _compaction_manager->start();
     setup_metrics();
 
     dblog.info("Row: max_vector_size: {}, internal_count: {}", size_t(row::max_vector_size), size_t(row::internal_count));
 }
 
-void flush_cpu_controller::adjust() {
-    auto mid = _goal + (hard_dirty_limit - _goal) / 2;
+void backlog_controller::adjust() {
+    auto backlog = _current_backlog();
 
-    auto dirty = _current_dirty();
-    if (dirty < _goal) {
-        _current_quota = dirty * q1 / _goal;
-    } else if ((dirty >= _goal) && (dirty < mid)) {
-        _current_quota = q1 + (dirty - _goal) * (q2 - q1)/(mid - _goal);
-    } else {
-        _current_quota = q2 + (dirty - mid) * (qmax - q2) / (hard_dirty_limit - mid);
+    // interpolate to find out which region we are. This run infrequently and there are a fixed
+    // number of points so a simple loop will do.
+    size_t idx = 1;
+    while ((idx < _control_points.size() - 1) && (_control_points[idx].input < backlog)) {
+        idx++;
     }
 
-    dblog.trace("dirty {}, goal {}, mid {} quota {}", dirty, _goal, mid, _current_quota);
-    _scheduling_group.update_usage(_current_quota);
+    control_point& cp = _control_points[idx];
+    control_point& last = _control_points[idx - 1];
+    float result = last.output + (backlog - last.input) * (cp.output - last.output)/(cp.input - last.input);
+    update_controller(result);
 }
 
-flush_cpu_controller::flush_cpu_controller(std::chrono::milliseconds interval, float soft_limit, std::function<float()> current_dirty)
-    : _goal(soft_limit / 2)
-    , _current_dirty(std::move(current_dirty))
-    , _interval(interval)
-    , _update_timer([this] { adjust(); })
-    , _scheduling_group(1ms, 0.0f)
-    , _current_scheduling_group(&_scheduling_group)
-{
-    _update_timer.arm_periodic(_interval);
+void backlog_controller::update_controller(float shares) {
+    _scheduling_group.set_shares(shares);
+    if (!_inflight_update.available()) {
+        return; // next timer will fix it
+    }
+    _inflight_update = engine().update_shares_for_class(_io_priority, uint32_t(shares));
 }
 
 void
@@ -2113,9 +2185,7 @@ dirty_memory_manager::setup_collectd(sstring namestr) {
     });
 }
 
-static const metrics::label user_label("user");
-static const metrics::label streaming_label("streaming");
-static const metrics::label system_label("system");
+static const metrics::label class_label("class");
 
 void
 database::setup_metrics() {
@@ -2125,9 +2195,9 @@ database::setup_metrics() {
 
     namespace sm = seastar::metrics;
 
-    auto user_label_instance = user_label("reads");
-    auto streaming_label_instance = streaming_label("reads");
-    auto system_label_instance = system_label("reads");
+    auto user_label_instance = class_label("user");
+    auto streaming_label_instance = class_label("streaming");
+    auto system_label_instance = class_label("system");
 
     _metrics.add_group("memory", {
         sm::make_gauge("dirty_bytes", [this] { return _dirty_memory_manager.real_dirty_memory() + _system_dirty_memory_manager.real_dirty_memory() + _streaming_dirty_memory_manager.real_dirty_memory(); },
@@ -2190,15 +2260,38 @@ database::setup_metrics() {
                        sm::description("Counts the total number of failed read operations. "
                                        "Add the total_reads to this value to get the total amount of reads issued on this shard.")),
 
+        sm::make_derive("querier_cache_lookups", _querier_cache.get_stats().lookups,
+                       sm::description("Counts querier cache lookups (paging queries)")),
+
+        sm::make_derive("querier_cache_misses", _querier_cache.get_stats().misses,
+                       sm::description("Counts querier cache lookups that failed to find a cached querier")),
+
+        sm::make_derive("querier_cache_drops", _querier_cache.get_stats().drops,
+                       sm::description("Counts querier cache lookups that found a cached querier but had to drop it due to position mismatch")),
+
+        sm::make_derive("querier_cache_time_based_evictions", _querier_cache.get_stats().time_based_evictions,
+                       sm::description("Counts querier cache entries that timed out and were evicted.")),
+
+        sm::make_derive("querier_cache_resource_based_evictions", _querier_cache.get_stats().resource_based_evictions,
+                       sm::description("Counts querier cache entries that were evicted to free up resources "
+                                       "(limited by reader concurency limits) necessary to create new readers.")),
+
+        sm::make_derive("querier_cache_memory_based_evictions", _querier_cache.get_stats().memory_based_evictions,
+                       sm::description("Counts querier cache entries that were evicted because the memory usage "
+                                       "of the cached queriers were above the limit.")),
+
+        sm::make_gauge("querier_cache_population", _querier_cache.get_stats().population,
+                       sm::description("The number of entries currently in the querier cache.")),
+
         sm::make_derive("sstable_read_queue_overloads", _stats->sstable_read_queue_overloaded,
                        sm::description("Counts the number of times the sstable read queue was overloaded. "
                                        "A non-zero value indicates that we have to drop read requests because they arrive faster than we can serve them.")),
 
-        sm::make_gauge("active_reads", [this] { return _stats->active_reads; },
+        sm::make_gauge("active_reads", [this] { return max_count_concurrent_reads - _read_concurrency_sem.available_resources().count; },
                        sm::description("Holds the number of currently active read operations. "),
                        {user_label_instance}),
 
-        sm::make_gauge("active_reads_memory_consumption", [this] { return max_memory_concurrent_reads() - _read_concurrency_sem.available_units(); },
+        sm::make_gauge("active_reads_memory_consumption", [this] { return max_memory_concurrent_reads() - _read_concurrency_sem.available_resources().memory; },
                        sm::description(seastar::format("Holds the amount of memory consumed by currently active read operations. "
                                                        "If this value gets close to {} we are likely to start dropping new read requests. "
                                                        "In that case sstable_read_queue_overloads is going to get a non-zero value.", max_memory_concurrent_reads())),
@@ -2208,12 +2301,12 @@ database::setup_metrics() {
                        sm::description("Holds the number of currently queued read operations."),
                        {user_label_instance}),
 
-        sm::make_gauge("active_reads", [this] { return _stats->active_reads_streaming; },
+        sm::make_gauge("active_reads", [this] { return max_count_streaming_concurrent_reads - _streaming_concurrency_sem.available_resources().count; },
                        sm::description("Holds the number of currently active read operations issued on behalf of streaming "),
                        {streaming_label_instance}),
 
 
-        sm::make_gauge("active_reads_memory_consumption", [this] { return max_memory_streaming_concurrent_reads() - _streaming_concurrency_sem.available_units(); },
+        sm::make_gauge("active_reads_memory_consumption", [this] { return max_memory_streaming_concurrent_reads() - _streaming_concurrency_sem.available_resources().memory; },
                        sm::description(seastar::format("Holds the amount of memory consumed by currently active read operations issued on behalf of streaming "
                                                        "If this value gets close to {} we are likely to start dropping new read requests. "
                                                        "In that case sstable_read_queue_overloads is going to get a non-zero value.", max_memory_streaming_concurrent_reads())),
@@ -2223,11 +2316,11 @@ database::setup_metrics() {
                        sm::description("Holds the number of currently queued read operations on behalf of streaming."),
                        {streaming_label_instance}),
 
-        sm::make_gauge("active_reads", [this] { return _stats->active_reads_system_keyspace; },
+        sm::make_gauge("active_reads", [this] { return max_count_system_concurrent_reads - _system_read_concurrency_sem.available_resources().count; },
                        sm::description("Holds the number of currently active read operations from \"system\" keyspace tables. "),
                        {system_label_instance}),
 
-        sm::make_gauge("active_reads_memory_consumption", [this] { return max_memory_system_concurrent_reads() - _system_read_concurrency_sem.available_units(); },
+        sm::make_gauge("active_reads_memory_consumption", [this] { return max_memory_system_concurrent_reads() - _system_read_concurrency_sem.available_resources().memory; },
                        sm::description(seastar::format("Holds the amount of memory consumed by currently active read operations from \"system\" keyspace tables. "
                                                        "If this value gets close to {} we are likely to start dropping new read requests. "
                                                        "In that case sstable_read_queue_overloads is going to get a non-zero value.", max_memory_system_concurrent_reads())),
@@ -2239,9 +2332,6 @@ database::setup_metrics() {
 
         sm::make_gauge("total_result_bytes", [this] { return get_result_memory_limiter().total_used_memory(); },
                        sm::description("Holds the current amount of memory used for results.")),
-
-        sm::make_gauge("cpu_flush_quota", [this] { return _memtable_cpu_controller.current_quota(); },
-                             sm::description("The current quota for memtable CPU scheduling group")),
 
         sm::make_derive("short_data_queries", _stats->short_data_queries,
                        sm::description("The rate of data queries (data or digest reads) that returned less rows than requested due to result size limiting.")),
@@ -2709,13 +2799,17 @@ keyspace::make_column_family_config(const schema& s, const db::config& db_config
     cfg.enable_cache = _config.enable_cache;
     cfg.dirty_memory_manager = _config.dirty_memory_manager;
     cfg.streaming_dirty_memory_manager = _config.streaming_dirty_memory_manager;
-    cfg.read_concurrency_config = _config.read_concurrency_config;
-    cfg.streaming_read_concurrency_config = _config.streaming_read_concurrency_config;
+    cfg.read_concurrency_semaphore = _config.read_concurrency_semaphore;
+    cfg.streaming_read_concurrency_semaphore = _config.streaming_read_concurrency_semaphore;
     cfg.cf_stats = _config.cf_stats;
     cfg.enable_incremental_backups = _config.enable_incremental_backups;
-    cfg.background_writer_scheduling_group = _config.background_writer_scheduling_group;
+    cfg.compaction_scheduling_group = _config.compaction_scheduling_group;
     cfg.memtable_scheduling_group = _config.memtable_scheduling_group;
+    cfg.memtable_to_cache_scheduling_group = _config.memtable_to_cache_scheduling_group;
+    cfg.streaming_scheduling_group = _config.streaming_scheduling_group;
+    cfg.statement_scheduling_group = _config.statement_scheduling_group;
     cfg.enable_metrics_reporting = db_config.enable_keyspace_column_family_metrics();
+    cfg.large_partition_warning_threshold_bytes = db_config.compaction_large_partition_warning_threshold_mb()*1024*1024;
 
     return cfg;
 }
@@ -2897,12 +2991,12 @@ compare_atomic_cell_for_merge(atomic_cell_view left, atomic_cell_view right) {
 struct query_state {
     explicit query_state(schema_ptr s,
                          const query::read_command& cmd,
-                         query::result_request request,
+                         query::result_options opts,
                          const dht::partition_range_vector& ranges,
                          query::result_memory_accounter memory_accounter = { })
             : schema(std::move(s))
             , cmd(cmd)
-            , builder(cmd.slice, request, std::move(memory_accounter))
+            , builder(cmd.slice, opts, std::move(memory_accounter))
             , limit(cmd.row_limit)
             , partition_limit(cmd.partition_limit)
             , current_partition_range(ranges.begin())
@@ -2916,7 +3010,6 @@ struct query_state {
     bool range_empty = false;   // Avoid ubsan false-positive when moving after construction
     dht::partition_range_vector::const_iterator current_partition_range;
     dht::partition_range_vector::const_iterator range_end;
-    mutation_reader reader;
     uint32_t remaining_rows() const {
         return limit - builder.row_count();
     }
@@ -2929,21 +3022,27 @@ struct query_state {
 };
 
 future<lw_shared_ptr<query::result>>
-column_family::query(schema_ptr s, const query::read_command& cmd, query::result_request request,
-                     const dht::partition_range_vector& partition_ranges,
-                     tracing::trace_state_ptr trace_state, query::result_memory_limiter& memory_limiter,
-                     uint64_t max_size) {
+column_family::query(schema_ptr s,
+        const query::read_command& cmd,
+        query::result_options opts,
+        const dht::partition_range_vector& partition_ranges,
+        tracing::trace_state_ptr trace_state,
+        query::result_memory_limiter& memory_limiter,
+        uint64_t max_size,
+        db::timeout_clock::time_point timeout,
+        querier_cache_context cache_ctx) {
     utils::latency_counter lc;
     _stats.reads.set_latency(lc);
-    auto f = request == query::result_request::only_digest
+    auto f = opts.request == query::result_request::only_digest
              ? memory_limiter.new_digest_read(max_size) : memory_limiter.new_data_read(max_size);
-    return f.then([this, lc, s = std::move(s), &cmd, request, &partition_ranges, trace_state = std::move(trace_state)] (query::result_memory_accounter accounter) mutable {
-        auto qs_ptr = std::make_unique<query_state>(std::move(s), cmd, request, partition_ranges, std::move(accounter));
+    return f.then([this, lc, s = std::move(s), &cmd, opts, &partition_ranges,
+            trace_state = std::move(trace_state), timeout, cache_ctx = std::move(cache_ctx)] (query::result_memory_accounter accounter) mutable {
+        auto qs_ptr = std::make_unique<query_state>(std::move(s), cmd, opts, partition_ranges, std::move(accounter));
         auto& qs = *qs_ptr;
-        return do_until(std::bind(&query_state::done, &qs), [this, &qs, trace_state = std::move(trace_state)] {
+        return do_until(std::bind(&query_state::done, &qs), [this, &qs, trace_state = std::move(trace_state), timeout, cache_ctx = std::move(cache_ctx)] {
             auto&& range = *qs.current_partition_range++;
             return data_query(qs.schema, as_mutation_source(), range, qs.cmd.slice, qs.remaining_rows(),
-                              qs.remaining_partitions(), qs.cmd.timestamp, qs.builder, trace_state);
+                              qs.remaining_partitions(), qs.cmd.timestamp, qs.builder, trace_state, timeout, cache_ctx);
         }).then([qs_ptr = std::move(qs_ptr), &qs] {
             return make_ready_future<lw_shared_ptr<query::result>>(
                     make_lw_shared<query::result>(qs.builder.build()));
@@ -2983,15 +3082,21 @@ std::chrono::milliseconds column_family::get_coordinator_read_latency_percentile
     return _percentile_cache_value;
 }
 
-static thread_local auto data_query_stage = seastar::make_execution_stage("data_query", &column_family::query);
-
 future<lw_shared_ptr<query::result>, cache_temperature>
-database::query(schema_ptr s, const query::read_command& cmd, query::result_request request, const dht::partition_range_vector& ranges, tracing::trace_state_ptr trace_state,
-                uint64_t max_result_size) {
+database::query(schema_ptr s, const query::read_command& cmd, query::result_options opts, const dht::partition_range_vector& ranges,
+                tracing::trace_state_ptr trace_state, uint64_t max_result_size, db::timeout_clock::time_point timeout) {
     column_family& cf = find_column_family(cmd.cf_id);
-    return data_query_stage(&cf, std::move(s), seastar::cref(cmd), request, seastar::cref(ranges),
-                            std::move(trace_state), seastar::ref(get_result_memory_limiter()),
-                            max_result_size).then_wrapped([this, s = _stats, hit_rate = cf.get_global_cache_hit_rate()] (auto f) {
+    querier_cache_context cache_ctx(_querier_cache, cmd.query_uuid, cmd.is_first_page);
+    return _data_query_stage(&cf,
+            std::move(s),
+            seastar::cref(cmd),
+            opts,
+            seastar::cref(ranges),
+            std::move(trace_state),
+            seastar::ref(get_result_memory_limiter()),
+            max_result_size,
+            timeout,
+            std::move(cache_ctx)).then_wrapped([this, s = _stats, hit_rate = cf.get_global_cache_hit_rate()] (auto f) {
         if (f.failed()) {
             ++s->total_reads_failed;
             return make_exception_future<lw_shared_ptr<query::result>, cache_temperature>(f.get_exception());
@@ -3006,10 +3111,20 @@ database::query(schema_ptr s, const query::read_command& cmd, query::result_requ
 
 future<reconcilable_result, cache_temperature>
 database::query_mutations(schema_ptr s, const query::read_command& cmd, const dht::partition_range& range,
-                          query::result_memory_accounter&& accounter, tracing::trace_state_ptr trace_state) {
+                          query::result_memory_accounter&& accounter, tracing::trace_state_ptr trace_state, db::timeout_clock::time_point timeout) {
     column_family& cf = find_column_family(cmd.cf_id);
-    return mutation_query(std::move(s), cf.as_mutation_source(), range, cmd.slice, cmd.row_limit, cmd.partition_limit,
-            cmd.timestamp, std::move(accounter), std::move(trace_state)).then_wrapped([this, s = _stats, hit_rate = cf.get_global_cache_hit_rate()] (auto f) {
+    querier_cache_context cache_ctx(_querier_cache, cmd.query_uuid, cmd.is_first_page);
+    return _mutation_query_stage(std::move(s),
+            cf.as_mutation_source(),
+            seastar::cref(range),
+            seastar::cref(cmd.slice),
+            cmd.row_limit,
+            cmd.partition_limit,
+            cmd.timestamp,
+            std::move(accounter),
+            std::move(trace_state),
+            timeout,
+            std::move(cache_ctx)).then_wrapped([this, s = _stats, hit_rate = cf.get_global_cache_hit_rate()] (auto f) {
         if (f.failed()) {
             ++s->total_reads_failed;
             return make_exception_future<reconcilable_result, cache_temperature>(f.get_exception());
@@ -3068,17 +3183,6 @@ void database::register_connection_drop_notifier(netw::messaging_service& ms) {
     });
 }
 
-std::ostream& operator<<(std::ostream& out, const atomic_cell_or_collection& c) {
-    return out << to_hex(c._data);
-}
-
-std::ostream& operator<<(std::ostream& os, const mutation& m) {
-    const ::schema& s = *m.schema();
-    fprint(os, "{%s.%s key %s data ", s.ks_name(), s.cf_name(), m.decorated_key());
-    os << m.partition() << "}";
-    return os;
-}
-
 std::ostream& operator<<(std::ostream& out, const column_family& cf) {
     return fprint(out, "{column_family: %s/%s}", cf._schema->ks_name(), cf._schema->cf_name());
 }
@@ -3123,7 +3227,7 @@ column_family::apply(const frozen_mutation& m, const schema_ptr& m_schema, db::r
 }
 
 future<mutation> database::do_apply_counter_update(column_family& cf, const frozen_mutation& fm, schema_ptr m_schema,
-                                                   timeout_clock::time_point timeout,tracing::trace_state_ptr trace_state) {
+                                                   db::timeout_clock::time_point timeout,tracing::trace_state_ptr trace_state) {
     auto m = fm.unfreeze(m_schema);
     m.upgrade(cf.schema());
 
@@ -3217,7 +3321,9 @@ future<> dirty_memory_manager::shutdown() {
     _db_shutdown_requested = true;
     _should_flush.signal();
     return std::move(_waiting_flush).then([this] {
-        return _region_group.shutdown();
+        return _virtual_region_group.shutdown().then([this] {
+            return _real_region_group.shutdown();
+        });
     });
 }
 
@@ -3251,11 +3357,9 @@ future<flush_permit> flush_permit::reacquire_sstable_write_permit() && {
 }
 
 future<> dirty_memory_manager::flush_one(memtable_list& mtlist, flush_permit&& permit) {
-    return mtlist.seal_active_memtable_immediate(std::move(permit)).then_wrapped([this, schema = mtlist.back()->schema()] (auto f) {
-        if (f.failed()) {
-            dblog.error("Failed to flush memtable, {}:{}", schema->ks_name(), schema->cf_name());
-        }
-        return std::move(f);
+    return mtlist.seal_active_memtable_immediate(std::move(permit)).handle_exception([this, schema = mtlist.back()->schema()] (std::exception_ptr ep) {
+        dblog.error("Failed to flush memtable, {}:{} - {}", schema->ks_name(), schema->cf_name(), ep);
+        return make_exception_future<>(ep);
     });
 }
 
@@ -3285,7 +3389,7 @@ future<> dirty_memory_manager::flush_when_needed() {
                 // memtable. The advantage of doing this is that this is objectively the one that will
                 // release the biggest amount of memory and is less likely to be generating tiny
                 // SSTables.
-                memtable& candidate_memtable = memtable::from_region(*(this->_region_group.get_largest_region()));
+                memtable& candidate_memtable = memtable::from_region(*(this->_virtual_region_group.get_largest_region()));
                 // Do not wait. The semaphore will protect us against a concurrent flush. But we
                 // want to start a new one as soon as the permits are destroyed and the semaphore is
                 // made ready again, not when we are done with the current one.
@@ -3307,7 +3411,7 @@ void dirty_memory_manager::start_reclaiming() noexcept {
     _should_flush.signal();
 }
 
-future<> database::apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&& h, timeout_clock::time_point timeout) {
+future<> database::apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&& h, db::timeout_clock::time_point timeout) {
     auto& cf = find_column_family(m.column_family_id());
     return cf.dirty_memory_region_group().run_when_memory_available([this, &m, m_schema = std::move(m_schema), h = std::move(h)]() mutable {
         try {
@@ -3319,13 +3423,13 @@ future<> database::apply_in_memory(const frozen_mutation& m, schema_ptr m_schema
     }, timeout);
 }
 
-future<> database::apply_in_memory(const mutation& m, column_family& cf, db::rp_handle&& h, timeout_clock::time_point timeout) {
+future<> database::apply_in_memory(const mutation& m, column_family& cf, db::rp_handle&& h, db::timeout_clock::time_point timeout) {
     return cf.dirty_memory_region_group().run_when_memory_available([this, &m, &cf, h = std::move(h)]() mutable {
         cf.apply(m, std::move(h));
     }, timeout);
 }
 
-future<mutation> database::apply_counter_update(schema_ptr s, const frozen_mutation& m, timeout_clock::time_point timeout, tracing::trace_state_ptr trace_state) {
+future<mutation> database::apply_counter_update(schema_ptr s, const frozen_mutation& m, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_state) {
   return update_write_metrics(seastar::futurize_apply([&] {
     if (!s->is_synced()) {
         throw std::runtime_error(sprint("attempted to mutate using not synced schema of %s.%s, version=%s",
@@ -3352,7 +3456,7 @@ static future<> maybe_handle_reorder(std::exception_ptr exp) {
     }
 }
 
-future<> database::apply_with_commitlog(column_family& cf, const mutation& m, timeout_clock::time_point timeout) {
+future<> database::apply_with_commitlog(column_family& cf, const mutation& m, db::timeout_clock::time_point timeout) {
     if (cf.commitlog() != nullptr) {
         return do_with(freeze(m), [this, &m, &cf, timeout] (frozen_mutation& fm) {
             commitlog_entry_writer cew(m.schema(), fm);
@@ -3364,7 +3468,7 @@ future<> database::apply_with_commitlog(column_family& cf, const mutation& m, ti
     return apply_in_memory(m, cf, {}, timeout);
 }
 
-future<> database::apply_with_commitlog(schema_ptr s, column_family& cf, utils::UUID uuid, const frozen_mutation& m, timeout_clock::time_point timeout) {
+future<> database::apply_with_commitlog(schema_ptr s, column_family& cf, utils::UUID uuid, const frozen_mutation& m, db::timeout_clock::time_point timeout) {
     auto cl = cf.commitlog();
     if (cl != nullptr) {
         commitlog_entry_writer cew(s, m);
@@ -3375,7 +3479,8 @@ future<> database::apply_with_commitlog(schema_ptr s, column_family& cf, utils::
     return apply_in_memory(m, std::move(s), {}, timeout);
 }
 
-future<> database::do_apply(schema_ptr s, const frozen_mutation& m, timeout_clock::time_point timeout) {
+future<> database::do_apply(schema_ptr s, const frozen_mutation& m, db::timeout_clock::time_point timeout) {
+  return with_scheduling_group(_dbcfg.statement_scheduling_group, [this, s = std::move(s), &m, timeout] () mutable {
     // I'm doing a nullcheck here since the init code path for db etc
     // is a little in flux and commitlog is created only when db is
     // initied from datadir.
@@ -3388,11 +3493,15 @@ future<> database::do_apply(schema_ptr s, const frozen_mutation& m, timeout_cloc
     if (cf.views().empty()) {
         return apply_with_commitlog(std::move(s), cf, std::move(uuid), m, timeout);
     }
-    auto f = cf.push_view_replica_updates(s, m);
-    return f.then([this, s = std::move(s), uuid = std::move(uuid), &m, timeout] {
+    future<row_locker::lock_holder> f = cf.push_view_replica_updates(s, m);
+    return f.then([this, s = std::move(s), uuid = std::move(uuid), &m, timeout] (row_locker::lock_holder lock) {
         auto& cf = find_column_family(uuid);
-        return apply_with_commitlog(std::move(s), cf, std::move(uuid), m, timeout);
+        return apply_with_commitlog(std::move(s), cf, std::move(uuid), m, timeout).finally(
+                // Hold the local lock on the base-table partition or row
+                // taken before the read, until the update is done.
+                [lock = std::move(lock)] { });
     });
+  });
 }
 
 struct db_apply_executor {
@@ -3418,7 +3527,7 @@ Future database::update_write_metrics(Future&& f) {
     });
 }
 
-future<> database::apply(schema_ptr s, const frozen_mutation& m, timeout_clock::time_point timeout) {
+future<> database::apply(schema_ptr s, const frozen_mutation& m, db::timeout_clock::time_point timeout) {
     if (dblog.is_enabled(logging::log_level::trace)) {
         dblog.trace("apply {}", m.pretty_printer(s));
     }
@@ -3430,10 +3539,12 @@ future<> database::apply_streaming_mutation(schema_ptr s, utils::UUID plan_id, c
         throw std::runtime_error(sprint("attempted to mutate using not synced schema of %s.%s, version=%s",
                                  s->ks_name(), s->cf_name(), s->version()));
     }
-    return _streaming_dirty_memory_manager.region_group().run_when_memory_available([this, &m, plan_id, fragmented, s = std::move(s)] {
-        auto uuid = m.column_family_id();
-        auto& cf = find_column_family(uuid);
-        cf.apply_streaming_mutation(s, plan_id, std::move(m), fragmented);
+    return with_scheduling_group(_dbcfg.streaming_scheduling_group, [this, s = std::move(s), &m, fragmented, plan_id] () mutable {
+        return _streaming_dirty_memory_manager.region_group().run_when_memory_available([this, &m, plan_id, fragmented, s = std::move(s)] {
+            auto uuid = m.column_family_id();
+            auto& cf = find_column_family(uuid);
+            cf.apply_streaming_mutation(s, plan_id, std::move(m), fragmented);
+        });
     });
 }
 
@@ -3457,25 +3568,16 @@ database::make_keyspace_config(const keyspace_metadata& ksm) {
     }
     cfg.dirty_memory_manager = &_dirty_memory_manager;
     cfg.streaming_dirty_memory_manager = &_streaming_dirty_memory_manager;
-    cfg.read_concurrency_config.resources_sem = &_read_concurrency_sem;
-    cfg.read_concurrency_config.active_reads = &_stats->active_reads;
-    cfg.read_concurrency_config.timeout = _cfg->read_request_timeout_in_ms() * 1ms;
-    cfg.read_concurrency_config.max_queue_length = 100;
-    cfg.read_concurrency_config.raise_queue_overloaded_exception = [this] {
-        ++_stats->sstable_read_queue_overloaded;
-        throw std::runtime_error("sstable inactive read queue overloaded");
-    };
-    // No timeouts or queue length limits - a failure here can kill an entire repair.
-    // Trust the caller to limit concurrency.
-    cfg.streaming_read_concurrency_config.resources_sem = &_streaming_concurrency_sem;
-    cfg.streaming_read_concurrency_config.active_reads = &_stats->active_reads_streaming;
+    cfg.read_concurrency_semaphore = &_read_concurrency_sem;
+    cfg.streaming_read_concurrency_semaphore = &_streaming_concurrency_sem;
     cfg.cf_stats = &_cf_stats;
     cfg.enable_incremental_backups = _enable_incremental_backups;
 
-    if (_cfg->background_writer_scheduling_quota() < 1.0f) {
-        cfg.background_writer_scheduling_group = &_background_writer_scheduling_group;
-        cfg.memtable_scheduling_group = _memtable_cpu_controller.scheduling_group();
-    }
+    cfg.compaction_scheduling_group = _dbcfg.compaction_scheduling_group;
+    cfg.memtable_scheduling_group = _dbcfg.memtable_scheduling_group;
+    cfg.memtable_to_cache_scheduling_group = _dbcfg.memtable_to_cache_scheduling_group;
+    cfg.streaming_scheduling_group = _dbcfg.streaming_scheduling_group;
+    cfg.statement_scheduling_group = _dbcfg.statement_scheduling_group;
     cfg.enable_metrics_reporting = _cfg->enable_keyspace_column_family_metrics();
     return cfg;
 }
@@ -3585,6 +3687,10 @@ database::stop() {
         return _dirty_memory_manager.shutdown();
     }).then([this] {
         return _streaming_dirty_memory_manager.shutdown();
+    }).then([this] {
+        return _memtable_controller.shutdown();
+    }).then([this] {
+        return _compaction_controller.shutdown();
     });
 }
 
@@ -3616,6 +3722,7 @@ future<> database::truncate(const keyspace& ks, column_family& cf, timestamp_fun
     return cf.run_async([this, &ks, &cf, tsf = std::move(tsf), with_snapshot] {
         const auto durable = ks.metadata()->durable_writes();
         const auto auto_snapshot = with_snapshot && get_config().auto_snapshot();
+        const auto should_flush = durable || auto_snapshot;
 
         // Force mutations coming in to re-acquire higher rp:s
         // This creates a "soft" ordering, in that we will guarantee that
@@ -3625,9 +3732,9 @@ future<> database::truncate(const keyspace& ks, column_family& cf, timestamp_fun
         auto low_mark = cf.set_low_replay_position_mark();
 
 
-        return cf.run_with_compaction_disabled([&cf, durable, auto_snapshot, tsf = std::move(tsf), low_mark]() mutable {
+        return cf.run_with_compaction_disabled([this, &cf, should_flush, auto_snapshot, tsf = std::move(tsf), low_mark]() mutable {
             future<> f = make_ready_future<>();
-            if (durable || auto_snapshot) {
+            if (should_flush) {
                 // TODO:
                 // this is not really a guarantee at all that we've actually
                 // gotten all things to disk. Again, need queue-ish or something.
@@ -3635,27 +3742,38 @@ future<> database::truncate(const keyspace& ks, column_family& cf, timestamp_fun
             } else {
                 f = cf.clear();
             }
-            return f.then([&cf, auto_snapshot, tsf = std::move(tsf), low_mark] {
+            return f.then([this, &cf, auto_snapshot, tsf = std::move(tsf), low_mark, should_flush] {
                 dblog.debug("Discarding sstable data for truncated CF + indexes");
                 // TODO: notify truncation
 
-                return tsf().then([&cf, auto_snapshot, low_mark](db_clock::time_point truncated_at) {
+                return tsf().then([this, &cf, auto_snapshot, low_mark, should_flush](db_clock::time_point truncated_at) {
                     future<> f = make_ready_future<>();
                     if (auto_snapshot) {
                         auto name = sprint("%d-%s", truncated_at.time_since_epoch().count(), cf.schema()->cf_name());
                         f = cf.snapshot(name);
                     }
-                    return f.then([&cf, truncated_at, low_mark] {
-                        return cf.discard_sstables(truncated_at).then([&cf, truncated_at, low_mark](db::replay_position rp) {
-                            // TODO: verify that rp == db::replay_position is because we have no sstables (and no data flushed)
-                            if (rp == db::replay_position()) {
-                                return make_ready_future();
-                            }
+                    return f.then([this, &cf, truncated_at, low_mark, should_flush] {
+                        return cf.discard_sstables(truncated_at).then([this, &cf, truncated_at, low_mark, should_flush](db::replay_position rp) {
                             // TODO: indexes.
                             assert(low_mark <= rp);
-                            return db::system_keyspace::save_truncation_record(cf, truncated_at, rp);
+                            return truncate_views(cf, truncated_at, should_flush).then([&cf, truncated_at, rp] {
+                                return db::system_keyspace::save_truncation_record(cf, truncated_at, rp);
+                            });
                         });
                     });
+                });
+            });
+        });
+    });
+}
+
+future<> database::truncate_views(const column_family& base, db_clock::time_point truncated_at, bool should_flush) {
+    return parallel_for_each(base.views(), [this, truncated_at, should_flush] (view_ptr v) {
+        auto& vcf = find_column_family(v);
+        return vcf.run_with_compaction_disabled([&vcf, truncated_at, should_flush] {
+            return (should_flush ? vcf.flush() : vcf.clear()).then([&vcf, truncated_at, should_flush] {
+                return vcf.discard_sstables(truncated_at).then([&vcf, truncated_at, should_flush](db::replay_position rp) {
+                    return db::system_keyspace::save_truncation_record(vcf, truncated_at, rp);
                 });
             });
         });
@@ -3905,14 +4023,14 @@ future<std::unordered_map<sstring, column_family::snapshot_details>> column_fami
             auto snapshot_name = de.name;
             all_snapshots.emplace(snapshot_name, snapshot_details());
             return lister::scan_dir(snapshots_dir / snapshot_name.c_str(),  { directory_entry_type::regular }, [this, &all_snapshots, snapshot_name = std::move(snapshot_name)] (lister::path snapshot_dir, directory_entry de) {
-                return io_check(file_size, (snapshot_dir / de.name.c_str()).native()).then([this, &all_snapshots, snapshot_name, name = de.name] (auto size) {
+                return io_check(file_size, (snapshot_dir / de.name.c_str()).native()).then([this, &all_snapshots, snapshot_name, snapshot_dir, name = de.name] (auto size) {
                     // The manifest is the only file expected to be in this directory not belonging to the SSTable.
                     // For it, we account the total size, but zero it for the true size calculation.
                     //
                     // All the others should just generate an exception: there is something wrong, so don't blindly
                     // add it to the size.
                     if (name != "manifest.json") {
-                        sstables::entry_descriptor::make_descriptor(name);
+                        sstables::entry_descriptor::make_descriptor(snapshot_dir.native(), name);
                         all_snapshots.at(snapshot_name).total += size;
                     } else {
                         size = 0;
@@ -3965,23 +4083,23 @@ future<> column_family::flush_streaming_mutations(utils::UUID plan_id, dht::part
             return _streaming_memtables->seal_active_memtable_delayed().then([this] {
                 return _streaming_flush_phaser.advance_and_await();
             }).then([this, sstables = std::move(sstables), ranges = std::move(ranges)] () mutable {
-                return _cache.invalidate([this, sstables = std::move(sstables), ranges = std::move(ranges)] () mutable noexcept {
+                return _cache.invalidate([this, sstables = std::move(sstables)] () mutable noexcept {
                     // FIXME: this is not really noexcept, but we need to provide strong exception guarantees.
                     for (auto&& sst : sstables) {
                         // seal_active_streaming_memtable_big() ensures sst is unshared.
-                        this->add_sstable(sst, {engine().cpu_id()});
+                        this->add_sstable(sst.sstable, {engine().cpu_id()});
                     }
                     this->try_trigger_compaction();
-                });
+                }, std::move(ranges));
             });
         });
     });
 }
 
-future<std::vector<sstables::shared_sstable>> column_family::flush_streaming_big_mutations(utils::UUID plan_id) {
+future<std::vector<column_family::monitored_sstable>> column_family::flush_streaming_big_mutations(utils::UUID plan_id) {
     auto it = _streaming_memtables_big.find(plan_id);
     if (it == _streaming_memtables_big.end()) {
-        return make_ready_future<std::vector<sstables::shared_sstable>>(std::vector<sstables::shared_sstable>());
+        return make_ready_future<std::vector<monitored_sstable>>(std::vector<monitored_sstable>());
     }
     auto entry = it->second;
     _streaming_memtables_big.erase(it);
@@ -3989,8 +4107,8 @@ future<std::vector<sstables::shared_sstable>> column_family::flush_streaming_big
         return entry->flush_in_progress.close();
     }).then([this, entry] {
         return parallel_for_each(entry->sstables, [this] (auto& sst) {
-            return sst->seal_sstable(this->incremental_backups_enabled()).then([sst] {
-                return sst->open_data();
+            return sst.sstable->seal_sstable(this->incremental_backups_enabled()).then([&sst] {
+                return sst.sstable->open_data();
             });
         }).then([this, entry] {
             return std::move(entry->sstables);
@@ -4007,7 +4125,7 @@ future<> column_family::fail_streaming_mutations(utils::UUID plan_id) {
     _streaming_memtables_big.erase(it);
     return entry->flush_in_progress.close().then([this, entry] {
         for (auto&& sst : entry->sstables) {
-            sst->mark_for_deletion();
+            sst.sstable->mark_for_deletion();
         }
     });
 }
@@ -4059,8 +4177,9 @@ future<db::replay_position> column_family::discard_sstables(db_clock::time_point
         return _cache.invalidate([p, truncated_at] {
             p->prune(truncated_at);
             dblog.debug("cleaning out row cache");
-        }).then([p]() mutable {
-            return parallel_for_each(p->remove, [](sstables::shared_sstable s) {
+        }).then([this, p]() mutable {
+            return parallel_for_each(p->remove, [this](sstables::shared_sstable s) {
+                _compaction_strategy.get_backlog_tracker().remove_sstable(s);
                 return sstables::delete_atomically({s});
             }).then([p] {
                 return make_ready_future<db::replay_position>(p->rp);
@@ -4191,11 +4310,11 @@ std::vector<view_ptr> column_family::affected_views(const schema_ptr& base, cons
 future<> column_family::generate_and_propagate_view_updates(const schema_ptr& base,
         std::vector<view_ptr>&& views,
         mutation&& m,
-        streamed_mutation_opt existings) const {
+        flat_mutation_reader_opt existings) const {
     auto base_token = m.token();
     return db::view::generate_view_updates(base,
                         std::move(views),
-                        streamed_mutation_from_mutation(std::move(m)),
+                        flat_mutation_reader_from_mutations({std::move(m)}),
                         std::move(existings)).then([base_token = std::move(base_token)] (auto&& updates) {
         db::view::mutate_MV(std::move(base_token), std::move(updates));
     });
@@ -4205,18 +4324,22 @@ future<> column_family::generate_and_propagate_view_updates(const schema_ptr& ba
  * Given an update for the base table, calculates the set of potentially affected views,
  * generates the relevant updates, and sends them to the paired view replicas.
  */
-future<> column_family::push_view_replica_updates(const schema_ptr& s, const frozen_mutation& fm) const {
+future<row_locker::lock_holder> column_family::push_view_replica_updates(const schema_ptr& s, const frozen_mutation& fm) const {
     //FIXME: Avoid unfreezing here.
     auto m = fm.unfreeze(s);
     auto& base = schema();
     m.upgrade(base);
     auto views = affected_views(base, m);
     if (views.empty()) {
-        return make_ready_future<>();
+        return make_ready_future<row_locker::lock_holder>();
     }
     auto cr_ranges = db::view::calculate_affected_clustering_ranges(*base, m.decorated_key(), m.partition(), views);
     if (cr_ranges.empty()) {
-        return generate_and_propagate_view_updates(base, std::move(views), std::move(m), { });
+        return generate_and_propagate_view_updates(base, std::move(views), std::move(m), { }).then([] {
+                // In this case we are not doing a read-before-write, just a
+                // write, so no lock is needed.
+                return make_ready_future<row_locker::lock_holder>();
+        });
     }
     // We read the whole set of regular columns in case the update now causes a base row to pass
     // a view's filters, and a view happens to include columns that have no value in this update.
@@ -4230,21 +4353,106 @@ future<> column_family::push_view_replica_updates(const schema_ptr& s, const fro
     opts.set(query::partition_slice::option::send_ttl);
     auto slice = query::partition_slice(
             std::move(cr_ranges), { }, std::move(columns), std::move(opts), { }, cql_serialization_format::internal(), query::max_rows);
-    return do_with(
+    // Take the shard-local lock on the base-table row or partition as needed.
+    // We'll return this lock to the caller, which will release it after
+    // writing the base-table update.
+    future<row_locker::lock_holder> lockf = local_base_lock(base, m.decorated_key(), slice.default_row_ranges());
+    return lockf.then([m = std::move(m), slice = std::move(slice), views = std::move(views), base, this] (row_locker::lock_holder lock) {
+      return do_with(
         dht::partition_range::make_singular(m.decorated_key()),
         std::move(slice),
         std::move(m),
-        [base, views = std::move(views), this] (auto& pk, auto& slice, auto& m) mutable {
-            auto reader = this->as_mutation_source()(
+        [base, views = std::move(views), lock = std::move(lock), this] (auto& pk, auto& slice, auto& m) mutable {
+            auto reader = this->as_mutation_source().make_reader(
                 base,
                 pk,
                 slice,
                 service::get_local_sstable_query_read_priority());
-            auto f = reader();
-            return f.then([&m, reader = std::move(reader), base = std::move(base), views = std::move(views), this] (auto&& existing) mutable {
-                return this->generate_and_propagate_view_updates(base, std::move(views), std::move(m), std::move(existing));
+            return this->generate_and_propagate_view_updates(base, std::move(views), std::move(m), std::move(reader)).then([lock = std::move(lock)] () mutable {
+                // return the local partition/row lock we have taken so it
+                // remains locked until the caller is done modifying this
+                // partition/row and destroys the lock object.
+                return std::move(lock);
             });
+      });
     });
+}
+
+/**
+ * Shard-local locking of clustering rows or entire partitions of the base
+ * table during a Materialized-View read-modify-update:
+ *
+ * Consider that two concurrent base-table updates set column C, a column
+ * added to a view's primary key, to two different values - V1 and V2.
+ * Say that that before the updates, C's value was V0. Both updates may remove
+ * from the view the old row with V0, one will add a view row with V1 and the
+ * second will add a view row with V2, and we end up with two rows, with the
+ * two different values, instead of just one row with the last value.
+ *
+ * The solution is to lock the base row which we read to ensure atomic read-
+ * modify-write to the view table: Under one locked section, the row with V0
+ * is deleted and a new one with V1 is created, and then under a second locked
+ * section the row with V1 is deleted and a new  one with V2 is created.
+ * Note that the lock is node-local (and in fact shard-local) and the locked
+ * section doesn't include the view table modifications - it includes just the
+ * read and the creation of the update commands - commands which will
+ * eventually be sent to the view replicas.
+ *
+ * We need to lock a base-table row even if an update does not modify the
+ * view's new key column C: Consider an update that only updates a non-key
+ * column (but also in the view) D. We still need to read the current base row
+ * to retrieve the view row's current key (column C), and then write the
+ * modification to *that* view row. Having several such modifications in
+ * parallel is fine. What is not fine is to have in parallel a modification
+ * of the value of C. So basically we need a reader-writer lock (a.k.a.
+ * shared-exclusive lock) on base rows:
+ * 1. Updates which do not modify the view's key column take a reader lock
+ *    on the base row.
+ * 2. Updates which do modify the view's key column take a writer lock.
+ *
+ * Further complicating matters is that some operations involve multiple
+ * base rows - such as a deletion of an entire partition or a range of rows.
+ * In that case, we should lock the entire partition, and forbid parallel
+ * work on the same partition or one of its rows. We can do this with a
+ * read-writer lock on base partitions:
+ * 1. Before we lock a row (as described above), we lock its partition key
+ *    with the reader lock.
+ * 2. When an operation involves an entire partition (or range of rows),
+ *    we lock the partition key with a writer lock.
+ *
+ * If an operation involves only a range of rows, not an entire partition,
+ * we could in theory lock only this range and not an entire partition.
+ * However, we expect this case to be rare enough to not care about and we
+ * currently just lock the entire partition.
+ *
+ * If a base table has *multiple* views, we still read the base table row
+ * only once, and have to keep a lock around this read and all the view
+ * updates generation. This lock needs to be the strictest of the above -
+ * i.e., if a column is modified which is not part of one view's key but is
+ * part of a second view's key - we should lock the base row with the
+ * stricter writer lock, not a reader lock.
+ */
+future<row_locker::lock_holder>
+column_family::local_base_lock(const schema_ptr& s, const dht::decorated_key& pk, const query::clustering_row_ranges& rows) const {
+    // FIXME: Optimization:
+    // Below we always pass "true" to the lock functions and take an exclusive
+    // lock on the affected row or partition. But as explained above, if all
+    // the modified columns are not key columns in *any* of the views, and
+    // shared lock is enough. We should test for this case and pass false.
+    // This will allow more parallelism in concurrent modifications to the
+    // same row - probably not a very urgent case.
+    _row_locker.upgrade(s);
+    if (rows.size() == 1 && rows[0].is_singular() && rows[0].start() && !rows[0].start()->value().is_empty(*s)) {
+        // A single clustering row is involved.
+        return _row_locker.lock_ck(pk, rows[0].start()->value(), true);
+    } else {
+        // More than a single clustering row is involved. Most commonly it's
+        // the entire partition, so let's lock the entire partition. We could
+        // lock less than the entire partition in more elaborate cases where
+        // just a few individual rows are involved, or row ranges, but we
+        // don't think this will make a practical difference.
+        return _row_locker.lock_pk(pk, true);
+    }
 }
 
 void column_family::set_hit_rate(gms::inet_address addr, cache_temperature rate) {
@@ -4287,7 +4495,7 @@ void column_family::drop_hit_rate(gms::inet_address addr) {
     _cluster_cache_hit_rates.erase(addr);
 }
 
-mutation_reader make_range_sstable_reader(schema_ptr s,
+flat_mutation_reader make_local_shard_sstable_reader(schema_ptr s,
         lw_shared_ptr<sstables::sstable_set> sstables,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
@@ -4295,35 +4503,72 @@ mutation_reader make_range_sstable_reader(schema_ptr s,
         reader_resource_tracker resource_tracker,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
-        mutation_reader::forwarding fwd_mr)
+        mutation_reader::forwarding fwd_mr,
+        sstables::read_monitor_generator& monitor_generator)
 {
-    return make_mutation_reader<combined_mutation_reader>(std::make_unique<incremental_reader_selector>(std::move(s),
-                std::move(sstables),
-                pr,
-                slice,
-                pc,
-                std::move(resource_tracker),
-                std::move(trace_state),
-                fwd,
-                fwd_mr), fwd_mr);
+    auto reader_factory_fn = [s, &slice, &pc, resource_tracker, fwd, fwd_mr, &monitor_generator] (sstables::shared_sstable& sst, const dht::partition_range& pr) {
+        flat_mutation_reader reader = sst->read_range_rows_flat(s, pr, slice, pc, resource_tracker, fwd, fwd_mr, monitor_generator(sst));
+        if (sst->is_shared()) {
+            using sig = bool (&)(const dht::decorated_key&);
+            reader = make_filtering_reader(std::move(reader), sig(belongs_to_current_shard));
+        }
+        return reader;
+    };
+    return make_combined_reader(s, std::make_unique<incremental_reader_selector>(s,
+                    std::move(sstables),
+                    pr,
+                    std::move(trace_state),
+                    std::move(reader_factory_fn)),
+            fwd,
+            fwd_mr);
+}
+
+flat_mutation_reader make_range_sstable_reader(schema_ptr s,
+        lw_shared_ptr<sstables::sstable_set> sstables,
+        const dht::partition_range& pr,
+        const query::partition_slice& slice,
+        const io_priority_class& pc,
+        reader_resource_tracker resource_tracker,
+        tracing::trace_state_ptr trace_state,
+        streamed_mutation::forwarding fwd,
+        mutation_reader::forwarding fwd_mr,
+        sstables::read_monitor_generator& monitor_generator)
+{
+    auto reader_factory_fn = [s, &slice, &pc, resource_tracker, fwd, fwd_mr, &monitor_generator] (sstables::shared_sstable& sst, const dht::partition_range& pr) {
+        return sst->read_range_rows_flat(s, pr, slice, pc, resource_tracker, fwd, fwd_mr, monitor_generator(sst));
+    };
+    return make_combined_reader(s, std::make_unique<incremental_reader_selector>(s,
+                    std::move(sstables),
+                    pr,
+                    std::move(trace_state),
+                    std::move(reader_factory_fn)),
+            fwd,
+            fwd_mr);
 }
 
 future<>
 write_memtable_to_sstable(memtable& mt, sstables::shared_sstable sst,
-                          seastar::shared_ptr<sstables::write_monitor> monitor,
-                          bool backup, const io_priority_class& pc, bool leave_unsealed,
-                          seastar::thread_scheduling_group *tsg) {
+                          sstables::write_monitor& monitor,
+                          bool backup, const io_priority_class& pc, bool leave_unsealed) {
     sstables::sstable_writer_config cfg;
     cfg.replay_position = mt.replay_position();
     cfg.backup = backup;
     cfg.leave_unsealed = leave_unsealed;
-    cfg.thread_scheduling_group = tsg;
-    cfg.monitor = std::move(monitor);
-    return sst->write_components(mt.make_flush_reader(mt.schema(), pc), mt.partition_count(), mt.schema(), cfg, pc);
+    cfg.monitor = &monitor;
+    return sst->write_components(mt.make_flush_reader(mt.schema(), pc),
+                                 mt.partition_count(), mt.schema(), cfg, pc);
 }
 
 future<>
 write_memtable_to_sstable(memtable& mt, sstables::shared_sstable sst) {
-    auto monitor = seastar::make_shared<permit_monitor>(sstable_write_permit::unconditional());
-    return write_memtable_to_sstable(mt, std::move(sst), std::move(monitor));
+    return do_with(permit_monitor(sstable_write_permit::unconditional()), [&mt, sst] (auto& monitor) {
+        return write_memtable_to_sstable(mt, std::move(sst), monitor);
+    });
+}
+
+std::ostream& operator<<(std::ostream& os, gc_clock::time_point tp) {
+    auto sec = std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
+    std::ostream tmp(os.rdbuf());
+    tmp << std::setw(12) << sec;
+    return os;
 }

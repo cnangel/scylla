@@ -33,11 +33,6 @@
 #include "schema_builder.hh"
 #include "schema_registry.hh"
 
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
-
 SEASTAR_TEST_CASE(test_new_schema_with_no_structural_change_is_propagated) {
     return do_with_cql_env([](cql_test_env& e) {
         return seastar::async([&] {
@@ -116,7 +111,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_ignored_in_version_calculation) {
                 BOOST_TEST_MESSAGE("Applying a no-op tombstone to v1 column definition");
                 auto s = db::schema_tables::columns();
                 auto pkey = partition_key::from_singular(*s, table_schema->ks_name());
-                mutation m(pkey, s);
+                mutation m(s, pkey);
                 auto ckey = clustering_key::from_exploded(*s, {utf8_type->decompose(table_schema->cf_name()), "v1"});
                 m.partition().apply_delete(*s, ckey, tombstone(api::min_timestamp, gc_clock::now()));
                 service::get_local_migration_manager().announce(std::vector<mutation>({m}), true).get();

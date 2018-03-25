@@ -22,16 +22,12 @@
 
 #include <boost/test/unit_test.hpp>
 #include "locator/ec2_snitch.hh"
+#include "utils/fb_utilities.hh"
 #include "tests/test-utils.hh"
 #include <boost/filesystem.hpp>
 #include <vector>
 #include <string>
 #include <tuple>
-
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
 
 static boost::filesystem::path test_files_subdir("tests/snitch_property_files");
 

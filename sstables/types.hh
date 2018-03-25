@@ -93,87 +93,48 @@ enum class indexable_element {
     cell
 };
 
-// Exploded view of promoted index.
-// Contains pointers into external buffer, so that buffer must be kept alive
-// as long as this is used.
-struct promoted_index {
-    struct entry {
-        composite_view start;
-        composite_view end;
-        uint64_t offset;
-        uint64_t width;
-    };
-    deletion_time del_time;
-    std::deque<entry> entries;
-};
-
-class promoted_index_view {
-    bytes_view _bytes;
+class promoted_index_block {
 public:
-    explicit promoted_index_view(bytes_view v) : _bytes(v) {}
-    sstables::deletion_time get_deletion_time() const;
-    promoted_index parse(const schema&) const;
-    explicit operator bool() const { return !_bytes.empty(); }
+    promoted_index_block(temporary_buffer<char>&& start, temporary_buffer<char>&& end,
+            uint64_t offset, uint64_t width)
+        : _start(std::move(start)), _end(std::move(end))
+        , _offset(offset), _width(width)
+    {}
+    promoted_index_block(const promoted_index_block& rhs)
+        : _start(rhs._start.get(), rhs._start.size()), _end(rhs._end.get(), rhs._end.size())
+        , _offset(rhs._offset), _width(rhs._width)
+    {}
+    promoted_index_block(promoted_index_block&&) noexcept = default;
+
+    promoted_index_block& operator=(const promoted_index_block& rhs) {
+        if (this != &rhs) {
+            _start = temporary_buffer<char>(rhs._start.get(), rhs._start.size());
+            _end = temporary_buffer<char>(rhs._end.get(), rhs._end.size());
+            _offset = rhs._offset;
+            _width = rhs._width;
+        }
+        return *this;
+    }
+    promoted_index_block& operator=(promoted_index_block&&) noexcept = default;
+
+    composite_view start(const schema& s) const { return composite_view(to_bytes_view(_start), s.is_compound());}
+    composite_view end(const schema& s) const { return composite_view(to_bytes_view(_end), s.is_compound());}
+    uint64_t offset() const { return _offset; }
+    uint64_t width() const { return _width; }
+
+private:
+    temporary_buffer<char> _start;
+    temporary_buffer<char> _end;
+    uint64_t _offset;
+    uint64_t _width;
 };
 
-class index_entry {
-    temporary_buffer<char> _key;
-    mutable stdx::optional<dht::token> _token;
-    uint64_t _position;
-    temporary_buffer<char> _promoted_index_bytes;
-    stdx::optional<promoted_index> _promoted_index;
+using promoted_index_blocks = seastar::circular_buffer<promoted_index_block>;
+
+class summary_entry {
 public:
-
-    bytes_view get_key_bytes() const {
-        return to_bytes_view(_key);
-    }
-
-    key_view get_key() const {
-        return key_view{get_key_bytes()};
-    }
-
-    decorated_key_view get_decorated_key() const {
-        if (!_token) {
-            _token.emplace(dht::global_partitioner().get_token(get_key()));
-        }
-        return decorated_key_view(*_token, get_key());
-    }
-
-    uint64_t position() const {
-        return _position;
-    }
-
-    bytes_view get_promoted_index_bytes() const {
-        return to_bytes_view(_promoted_index_bytes);
-    }
-
-    promoted_index_view get_promoted_index_view() const {
-        return promoted_index_view(get_promoted_index_bytes());
-    }
-
-    index_entry(temporary_buffer<char>&& key, uint64_t position, temporary_buffer<char>&& promoted_index)
-        : _key(std::move(key)), _position(position), _promoted_index_bytes(std::move(promoted_index)) {}
-
-    index_entry(const index_entry& o)
-        : _key(o._key.get(), o._key.size())
-        , _position(o._position)
-        , _promoted_index_bytes(o._promoted_index_bytes.get(), o._promoted_index_bytes.size())
-    { }
-
-    promoted_index* get_promoted_index(const schema& s) {
-        if (!_promoted_index) {
-            auto v = get_promoted_index_view();
-            if (v) {
-                _promoted_index = v.parse(s);
-            }
-        }
-        return _promoted_index ? &*_promoted_index : nullptr;
-    }
-};
-
-struct summary_entry {
-    dht::token token;
-    bytes key;
+    dht::token_view token;
+    bytes_view key;
     uint64_t position;
 
     key_view get_key() const {
@@ -236,8 +197,8 @@ struct summary_ka {
     uint64_t memory_footprint() const {
         auto sz = sizeof(summary_entry) * entries.size() + sizeof(uint32_t) * positions.size() + sizeof(*this);
         sz += first_key.value.size() + last_key.value.size();
-        for (auto& e : entries) {
-            sz += e.key.size();
+        for (auto& sd : _summary_data) {
+            sz += sd.size();
         }
         return sz;
     }
@@ -245,6 +206,38 @@ struct summary_ka {
     explicit operator bool() const {
         return entries.size();
     }
+
+    bytes_view add_summary_data(bytes_view data) {
+        if (_summary_data.empty() || (_summary_index_pos + data.size() > _buffer_size)) {
+            _buffer_size = std::min(_buffer_size << 1, 128u << 10);
+            // Keys are 64kB max, so it might be one key may not fit in a buffer
+            _buffer_size = std::max(_buffer_size, unsigned(data.size()));
+            _summary_data.emplace_back(_buffer_size);
+            _summary_index_pos = 0;
+        }
+
+        auto ret = _summary_data.back().store_at(_summary_index_pos, data);
+        _summary_index_pos += data.size();
+        return ret;
+    }
+private:
+    class summary_data_memory {
+        unsigned _size;
+        std::unique_ptr<bytes::value_type[]> _data;
+    public:
+        summary_data_memory(unsigned size) : _size(size), _data(std::make_unique<bytes::value_type[]>(size)) {}
+        bytes_view store_at(unsigned pos, bytes_view src) {
+            auto addr = _data.get() + pos;
+            std::copy_n(src.data(), src.size(), addr);
+            return bytes_view(addr, src.size());
+        }
+        unsigned size() const {
+            return _size;
+        }
+    };
+    unsigned _buffer_size = 1 << 10;
+    std::vector<summary_data_memory> _summary_data = {};
+    unsigned _summary_index_pos = 0;
 };
 using summary = summary_ka;
 
@@ -354,6 +347,28 @@ struct sharding_metadata {
     auto describe_type(Describer f) { return f(token_ranges); }
 };
 
+// Scylla-specific list of features an sstable supports.
+enum sstable_feature : uint8_t {
+    NonCompoundPIEntries = 0,       // See #2993
+    NonCompoundRangeTombstones = 1, // See #2986
+    End = 2
+};
+
+// Scylla-specific features enabled for a particular sstable.
+struct sstable_enabled_features {
+    uint64_t enabled_features;
+
+    bool is_enabled(sstable_feature f) const {
+        return enabled_features & (1 << f);
+    }
+
+    void disable(sstable_feature f) {
+        enabled_features &= ~(1<< f);
+    }
+
+    template <typename Describer>
+    auto describe_type(Describer f) { return f(enabled_features); }
+};
 
 // Numbers are found on disk, so they do matter. Also, setting their sizes of
 // that of an uint32_t is a bit wasteful, but it simplifies the code a lot
@@ -365,15 +380,36 @@ enum class metadata_type : uint32_t {
     Stats = 2,
 };
 
-
 enum class scylla_metadata_type : uint32_t {
     Sharding = 1,
+    Features = 2,
+    ExtensionAttributes = 3,
 };
 
 struct scylla_metadata {
+    using extension_attributes = disk_hash<uint32_t, disk_string<uint32_t>, disk_string<uint32_t>>;
+
     disk_set_of_tagged_union<scylla_metadata_type,
-            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Sharding, sharding_metadata>
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Sharding, sharding_metadata>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Features, sstable_enabled_features>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ExtensionAttributes, extension_attributes>
             > data;
+
+    bool has_feature(sstable_feature f) const {
+        auto features = data.get<scylla_metadata_type::Features, sstable_enabled_features>();
+        return features && features->is_enabled(f);
+    }
+    const extension_attributes* get_extension_attributes() const {
+        return data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
+    }
+    extension_attributes& get_or_create_extension_attributes() {
+        auto* ext = data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
+        if (ext == nullptr) {
+            data.set<scylla_metadata_type::ExtensionAttributes>(extension_attributes{});
+            ext = data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
+        }
+        return *ext;
+    }
 
     template <typename Describer>
     auto describe_type(Describer f) { return f(data); }

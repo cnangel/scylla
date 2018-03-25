@@ -85,7 +85,53 @@ The `-c1 -m1G` arguments limit this Seastar-based test to a single system thread
 
 All changes to Scylla are submitted as patches to the public mailing list. Once a patch is approved by one of the maintainers of the project, it is committed to the maintainers' copy of the repository at https://github.com/scylladb/scylla.
 
-Detailed instructions for formatting patches for the mailing list and advice on preparing good patches are available at the [ScyllaDB website](http://docs.scylladb.com/contribute/).
+Detailed instructions for formatting patches for the mailing list and advice on preparing good patches are available at the [ScyllaDB website](http://docs.scylladb.com/contribute/). There are also some guidelines that can help you make the patch review process smoother:
+
+1. Before generating patches, make sure your Git configuration points to `.gitorderfile`. You can do it by running
+
+```bash
+$ git config diff.orderfile .gitorderfile
+```
+
+2. If you are sending more than a single patch, push your changes into a new branch of your fork of Scylla on GitHub and add a URL pointing to this branch to your cover letter.
+
+3. If you are sending a new revision of an earlier patchset, add a brief summary of changes in this version, for example:
+```
+In v3:
+    - declared move constructor and move assignment operator as noexcept
+    - used std::variant instead of a union
+    ...
+```
+
+4. Add information about the tests run with this fix. It can look like
+```
+"Tests: unit ({mode}), dtest ({smp})"
+```
+
+The usual is "Tests: unit (release)", although running debug tests is encouraged.
+
+5. When answering review comments, prefer inline quotes as they make it easier to track the conversation across multiple e-mails.
+
+### Finding a person to review and merge your patches
+
+You can use the `scripts/find-maintainer` script to find a subsystem maintainer and/or reviewer for your patches. The script accepts a filename in the git source tree as an argument and outputs a list of subsystems the file belongs to and their respective maintainers and reviewers. For example, if you changed the `cql3/statements/create_view_statement.hh` file, run the script as follows:
+
+```bash
+$ ./scripts/find-maintainer cql3/statements/create_view_statement.hh
+```
+
+and you will get output like this:
+
+```
+CQL QUERY LANGUAGE
+  Tomasz Grabiec <tgrabiec@scylladb.com>   [maintainer]
+  Pekka Enberg <penberg@scylladb.com>      [maintainer]
+MATERIALIZED VIEWS
+  Pekka Enberg <penberg@scylladb.com>      [maintainer]
+  Duarte Nunes <duarte@scylladb.com>       [maintainer]
+  Nadav Har'El <nyh@scylladb.com>          [reviewer]
+  Duarte Nunes <duarte@scylladb.com>       [reviewer]
+```
 
 ### Running Scylla
 

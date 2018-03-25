@@ -65,7 +65,7 @@
 #include <seastar/core/rwlock.hh>
 #include "db/batchlog_manager.hh"
 #include "db/commitlog/commitlog.hh"
-#include "auth/auth.hh"
+#include "db/hints/manager.hh"
 #include <seastar/net/tls.hh>
 #include <seastar/net/dns.hh>
 #include "utils/exceptions.hh"
@@ -90,6 +90,11 @@ static const sstring INDEXES_FEATURE = "INDEXES";
 static const sstring DIGEST_MULTIPARTITION_READ_FEATURE = "DIGEST_MULTIPARTITION_READ";
 static const sstring CORRECT_COUNTER_ORDER_FEATURE = "CORRECT_COUNTER_ORDER";
 static const sstring SCHEMA_TABLES_V3 = "SCHEMA_TABLES_V3";
+static const sstring CORRECT_NON_COMPOUND_RANGE_TOMBSTONES = "CORRECT_NON_COMPOUND_RANGE_TOMBSTONES";
+static const sstring WRITE_FAILURE_REPLY_FEATURE = "WRITE_FAILURE_REPLY";
+static const sstring XXHASH_FEATURE = "XXHASH";
+static const sstring ROLES_FEATURE = "ROLES";
+static const sstring LA_SSTABLE_FEATURE = "LA_SSTABLE_FORMAT";
 
 distributed<storage_service> _the_storage_service;
 
@@ -100,9 +105,11 @@ int get_generation_number() {
     return generation_number;
 }
 
-storage_service::storage_service(distributed<database>& db)
+storage_service::storage_service(distributed<database>& db, sharded<auth::service>& auth_service)
         : _db(db)
-        , _replicate_action([this] { return do_replicate_to_all_cores(); }) {
+        , _auth_service(auth_service)
+        , _replicate_action([this] { return do_replicate_to_all_cores(); })
+        , _update_pending_ranges_action([this] { return do_update_pending_ranges(); }) {
     sstable_read_error.connect([this] { isolate_on_error(); });
     sstable_write_error.connect([this] { isolate_on_error(); });
     general_disk_error.connect([this] { isolate_on_error(); });
@@ -133,7 +140,12 @@ sstring storage_service::get_config_supported_features() {
         COUNTERS_FEATURE,
         DIGEST_MULTIPARTITION_READ_FEATURE,
         CORRECT_COUNTER_ORDER_FEATURE,
-        SCHEMA_TABLES_V3
+        SCHEMA_TABLES_V3,
+        CORRECT_NON_COMPOUND_RANGE_TOMBSTONES,
+        WRITE_FAILURE_REPLY_FEATURE,
+        XXHASH_FEATURE,
+        ROLES_FEATURE,
+        LA_SSTABLE_FEATURE,
     };
     if (service::get_local_storage_service()._db.local().get_config().experimental()) {
         features.push_back(MATERIALIZED_VIEWS_FEATURE);
@@ -196,7 +208,7 @@ bool storage_service::should_bootstrap() {
 }
 
 // Runs inside seastar::async context
-void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints) {
+void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints, bind_messaging_port do_bind) {
     if (_joined) {
         return;
     }
@@ -261,20 +273,22 @@ void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints
                         gossiper.do_shadow_round().get();
                         ok = true;
                     } catch (...) {
+                        slogger.info("Shadow round failed with {}", std::current_exception());
                         gossiper.finish_shadow_round();
                         ok = false;
                     }
 
                     if (ok) {
                         gossiper.check_knows_remote_features(local_features);
-                        gossiper.reset_endpoint_state_map();
-                        for (auto ep : loaded_endpoints) {
-                            gossiper.add_saved_endpoint(ep);
-                        }
                     } else {
                         // Check features with system table
                         slogger.info("Checking remote features with gossip failed, fallback to check with system table");
                         gossiper.check_knows_remote_features(local_features, peer_features);
+                    }
+
+                    gossiper.reset_endpoint_state_map();
+                    for (auto ep : loaded_endpoints) {
+                        gossiper.add_saved_endpoint(ep);
                     }
                 }
             }
@@ -316,7 +330,7 @@ void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints
     auto& gossiper = gms::get_local_gossiper();
     gossiper.register_(this->shared_from_this());
     auto generation_number = db::system_keyspace::increment_and_get_generation().get0();
-    gossiper.start_gossiping(generation_number, app_states).get();
+    gossiper.start_gossiping(generation_number, app_states, gms::bind_messaging_port(bool(do_bind))).get();
 
     // gossip snitch infos (local DC and rack)
     gossip_snitch_info().get();
@@ -344,6 +358,11 @@ void storage_service::register_features() {
     _digest_multipartition_read_feature = gms::feature(DIGEST_MULTIPARTITION_READ_FEATURE);
     _correct_counter_order_feature = gms::feature(CORRECT_COUNTER_ORDER_FEATURE);
     _schema_tables_v3 = gms::feature(SCHEMA_TABLES_V3);
+    _correct_non_compound_range_tombstones = gms::feature(CORRECT_NON_COMPOUND_RANGE_TOMBSTONES);
+    _write_failure_reply_feature = gms::feature(WRITE_FAILURE_REPLY_FEATURE);
+    _xxhash_feature = gms::feature(XXHASH_FEATURE);
+    _roles_feature = gms::feature(ROLES_FEATURE);
+    _la_sstable_feature = gms::feature(LA_SSTABLE_FEATURE);
 
     if (_db.local().get_config().experimental()) {
         _materialized_views_feature = gms::feature(MATERIALIZED_VIEWS_FEATURE);
@@ -521,7 +540,15 @@ void storage_service::join_token_ring(int delay) {
             slogger.error("{}", err);
             throw std::runtime_error(err);
         }
-        auth::auth::setup().get();
+
+        _auth_service.start(
+                auth::permissions_cache_config::from_db_config(_db.local().get_config()),
+                std::ref(cql3::get_query_processor()),
+                std::ref(service::get_migration_manager()),
+                auth::service_config::from_db_config(_db.local().get_config())).get();
+
+        _auth_service.invoke_on_all(&auth::service::start).get();
+
         supervisor::notify("starting tracing");
         tracing::tracing::start_tracing().get();
     } else {
@@ -546,7 +573,14 @@ future<> storage_service::join_ring() {
                     slogger.error("{}", err);
                     throw std::runtime_error(err);
                 }
-                auth::auth::setup().get();
+
+                ss._auth_service.start(
+                        auth::permissions_cache_config::from_db_config(ss._db.local().get_config()),
+                        std::ref(cql3::get_query_processor()),
+                        std::ref(service::get_migration_manager()),
+                        auth::service_config::from_db_config(ss._db.local().get_config())).get();
+
+               ss._auth_service.invoke_on_all(&auth::service::start).get();
             }
         });
     });
@@ -566,10 +600,12 @@ void storage_service::bootstrap(std::unordered_set<token> tokens) {
     auto& gossiper = gms::get_local_gossiper();
     if (!db().local().is_replacing()) {
         // if not an existing token then bootstrap
-        gossiper.add_local_application_state(gms::application_state::TOKENS, value_factory.tokens(tokens)).get();
-        gossiper.add_local_application_state(gms::application_state::STATUS, value_factory.bootstrapping(tokens)).get();
+        gossiper.add_local_application_state({
+            { gms::application_state::TOKENS, value_factory.tokens(tokens) },
+            { gms::application_state::STATUS, value_factory.bootstrapping(tokens) },
+        }).get();
         set_mode(mode::JOINING, sprint("sleeping %s ms for pending range setup", get_ring_delay().count()), true);
-        sleep(get_ring_delay()).get();
+        gossiper.wait_for_range_setup().get();
     } else {
         // Dont set any state for the node which is bootstrapping the existing token...
         _token_metadata.update_normal_tokens(tokens, get_broadcast_address());
@@ -773,7 +809,7 @@ void storage_service::handle_state_normal(inet_address endpoint) {
     // a race where natural endpoint was updated to contain node A, but A was
     // not yet removed from pending endpoints
     _token_metadata.update_normal_tokens(tokens_to_update_in_metadata, endpoint);
-    do_update_pending_ranges();
+    _update_pending_ranges_action.trigger_later().get();
 
     for (auto ep : endpoints_to_remove) {
         remove_endpoint(ep);
@@ -855,7 +891,13 @@ void storage_service::handle_state_leaving(inet_address endpoint) {
     // at this point the endpoint is certainly a member with this token, so let's proceed
     // normally
     _token_metadata.add_leaving_endpoint(endpoint);
-    update_pending_ranges().get();
+    update_pending_ranges_nowait(endpoint);
+}
+
+void storage_service::update_pending_ranges_nowait(inet_address endpoint) {
+    update_pending_ranges().handle_exception([endpoint] (std::exception_ptr ep) {
+        slogger.info("Failed to update_pending_ranges for node {}: {}", endpoint, ep);
+    });
 }
 
 void storage_service::handle_state_left(inet_address endpoint, std::vector<sstring> pieces) {
@@ -931,7 +973,17 @@ void storage_service::handle_state_removing(inet_address endpoint, std::vector<s
                 slogger.warn("{}", err);
                 throw std::runtime_error(err);
             }
-            restore_replica_count(endpoint, ep.value()).get();
+            // Kick off streaming commands. No need to wait for
+            // restore_replica_count to complete which can take a long time,
+            // since when it completes, this node will send notification to
+            // tell the removal_coordinator with IP address notify_endpoint
+            // that the restore process is finished on this node. This node
+            // will be removed from _replicating_nodes on the
+            // removal_coordinator.
+            auto notify_endpoint = ep.value();
+            restore_replica_count(endpoint, notify_endpoint).handle_exception([endpoint, notify_endpoint] (auto ep) {
+                slogger.info("Failed to restore_replica_count for node {}, notify_endpoint={} : {}", endpoint, notify_endpoint, ep);
+            });
         }
     } else { // now that the gossiper has told us about this nonexistent member, notify the gossiper to remove it
         if (sstring(gms::versioned_value::REMOVED_TOKEN) == pieces[0]) {
@@ -983,6 +1035,7 @@ void storage_service::on_change(inet_address endpoint, application_state state, 
         boost::split(pieces, value.value, boost::is_any_of(sstring(versioned_value::DELIMITER_STR)));
         if (pieces.empty()) {
             slogger.warn("Fail to split status in on_change: endpoint={}, app_state={}, value={}", endpoint, state, value);
+            return;
         }
         sstring move_name = pieces[0];
         if (move_name == sstring(versioned_value::STATUS_BOOTSTRAPPING)) {
@@ -999,7 +1052,11 @@ void storage_service::on_change(inet_address endpoint, application_state state, 
             handle_state_left(endpoint, pieces);
         } else if (move_name == sstring(versioned_value::STATUS_MOVING)) {
             handle_state_moving(endpoint, pieces);
+        } else {
+            return; // did nothing.
         }
+        // we have (most likely) modified token metadata
+        replicate_to_all_cores().get();
     } else {
         auto& gossiper = gms::get_local_gossiper();
         auto* ep_state = gossiper.get_endpoint_state_for_endpoint_ptr(endpoint);
@@ -1016,7 +1073,6 @@ void storage_service::on_change(inet_address endpoint, application_state state, 
             }
         }
     }
-    replicate_to_all_cores().get();
 }
 
 
@@ -1134,16 +1190,18 @@ void storage_service::set_tokens(std::unordered_set<token> tokens) {
     slogger.debug("Setting tokens to {}", tokens);
     db::system_keyspace::update_tokens(tokens).get();
     auto local_tokens = get_local_tokens().get0();
-    set_gossip_tokens(local_tokens);
     _token_metadata.update_normal_tokens(tokens, get_broadcast_address());
-    set_mode(mode::NORMAL, "node is now in normal status", true);
     replicate_to_all_cores().get();
+    set_gossip_tokens(local_tokens);
+    set_mode(mode::NORMAL, "node is now in normal status", true);
 }
 
 void storage_service::set_gossip_tokens(const std::unordered_set<dht::token>& local_tokens) {
     auto& gossiper = gms::get_local_gossiper();
-    gossiper.add_local_application_state(gms::application_state::TOKENS, value_factory.tokens(local_tokens)).get();
-    gossiper.add_local_application_state(gms::application_state::STATUS, value_factory.normal(local_tokens)).get();
+    gossiper.add_local_application_state({
+        { gms::application_state::TOKENS, value_factory.tokens(local_tokens) },
+        { gms::application_state::STATUS, value_factory.normal(local_tokens) }
+    }).get();
 }
 
 void storage_service::register_subscriber(endpoint_lifecycle_subscriber* subscriber)
@@ -1175,7 +1233,7 @@ future<> storage_service::stop_transport() {
             ss.do_stop_stream_manager().get();
             slogger.info("Stop transport: shutdown stream_manager done");
 
-            auth::auth::shutdown().get();
+            ss._auth_service.stop().get();
             slogger.info("Stop transport: auth shutdown");
 
             slogger.info("Stop transport: done");
@@ -1201,6 +1259,11 @@ future<> storage_service::drain_on_shutdown() {
             tracing::tracing::tracing_instance().stop().get();
             slogger.info("Drain on shutdown: tracing is stopped");
 
+            get_storage_proxy().invoke_on_all([] (storage_proxy& local_proxy) {
+                return local_proxy.stop_hints_manager();
+            }).get();
+            slogger.info("Drain on shutdown: hints manager is stopped");
+
             ss.flush_column_families();
             slogger.info("Drain on shutdown: flush column_families done");
 
@@ -1209,7 +1272,7 @@ future<> storage_service::drain_on_shutdown() {
             }).get();
             slogger.info("Drain on shutdown: shutdown commitlog done");
 
-            // NOTE: We currently don't destory migration_manager nor
+            // NOTE: We currently don't destroy migration_manager nor
             // storage_service in scylla, so when we reach here
             // migration_manager should to be still alive. Be careful, when
             // scylla starts to destroy migration_manager in the shutdown
@@ -1278,11 +1341,12 @@ future<> storage_service::drain_on_shutdown() {
 #endif
 }
 
-future<> storage_service::init_server(int delay) {
-    return seastar::async([this, delay] {
-        get_storage_service().invoke_on_all([] (auto& ss) {
-            ss.init_messaging_service();
-        }).get();
+future<> storage_service::init_messaging_service_part() {
+    return get_storage_service().invoke_on_all(&service::storage_service::init_messaging_service);
+}
+
+future<> storage_service::init_server(int delay, bind_messaging_port do_bind) {
+    return seastar::async([this, delay, do_bind] {
         auto& gossiper = gms::get_local_gossiper();
 #if 0
         slogger.info("Cassandra version: {}", FBUtilities.getReleaseVersionString());
@@ -1339,7 +1403,7 @@ future<> storage_service::init_server(int delay) {
             }
         }
 
-        prepare_to_join(std::move(loaded_endpoints));
+        prepare_to_join(std::move(loaded_endpoints), do_bind);
 #if 0
         // Has to be called after the host id has potentially changed in prepareToJoin().
         for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
@@ -1354,10 +1418,18 @@ future<> storage_service::init_server(int delay) {
             if (!tokens.empty()) {
                 _token_metadata.update_normal_tokens(tokens, get_broadcast_address());
                 // order is important here, the gossiper can fire in between adding these two states.  It's ok to send TOKENS without STATUS, but *not* vice versa.
-                gossiper.add_local_application_state(gms::application_state::TOKENS, value_factory.tokens(tokens)).get();
-                gossiper.add_local_application_state(gms::application_state::STATUS, value_factory.hibernate(true)).get();
+                gossiper.add_local_application_state({
+                    { gms::application_state::TOKENS, value_factory.tokens(tokens) },
+                    { gms::application_state::STATUS, value_factory.hibernate(true) }
+                }).get();
             }
             slogger.info("Not joining ring as requested. Use JMX (StorageService->joinRing()) to initiate ring joining");
+        }
+
+        if (_db.local().get_config().enable_sstable_data_integrity_check()) {
+            slogger.info0("SSTable data integrity checker is enabled.");
+        } else {
+            slogger.info0("SSTable data integrity checker is disabled.");
         }
     });
 }
@@ -1397,8 +1469,9 @@ future<> storage_service::gossip_snitch_info() {
     auto dc = snitch->get_datacenter(addr);
     auto rack = snitch->get_rack(addr);
     auto& gossiper = gms::get_local_gossiper();
-    return gossiper.add_local_application_state(gms::application_state::DC, value_factory.datacenter(dc)).then([this, &gossiper, rack] {
-        return gossiper.add_local_application_state(gms::application_state::RACK, value_factory.rack(rack));
+    return gossiper.add_local_application_state({
+        { gms::application_state::DC, value_factory.datacenter(dc) },
+        { gms::application_state::RACK, value_factory.rack(rack) }
     });
 }
 
@@ -1433,7 +1506,8 @@ future<> storage_service::check_for_endpoint_collision() {
                     if (state.empty()) {
                         continue;
                     }
-                    slogger.debug("Checking bootstrapping/leaving/moving nodes: node={}, status={} (check_for_endpoint_collision)", x.first, state);
+                    auto addr = x.first;
+                    slogger.debug("Checking bootstrapping/leaving/moving nodes: node={}, status={} (check_for_endpoint_collision)", addr, state);
                     if (state == sstring(versioned_value::STATUS_BOOTSTRAPPING) ||
                         state == sstring(versioned_value::STATUS_LEAVING) ||
                         state == sstring(versioned_value::STATUS_MOVING)) {
@@ -1444,7 +1518,7 @@ future<> storage_service::check_for_endpoint_collision() {
                             gossiper.reset_endpoint_state_map();
                             found_bootstrapping_node = true;
                             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(gms::gossiper::clk::now() - t).count();
-                            slogger.info("Checking bootstrapping/leaving/moving nodes: node={}, status={}, sleep 1 second and check again ({} seconds elapsed) (check_for_endpoint_collision)", x.first, state, elapsed);
+                            slogger.info("Checking bootstrapping/leaving/moving nodes: node={}, status={}, sleep 1 second and check again ({} seconds elapsed) (check_for_endpoint_collision)", addr, state, elapsed);
                             sleep(std::chrono::seconds(1)).get();
                             break;
                         }
@@ -1691,14 +1765,14 @@ future<bool> storage_service::is_gossip_running() {
     });
 }
 
-future<> storage_service::start_gossiping() {
-    return run_with_api_lock(sstring("start_gossiping"), [] (storage_service& ss) {
-        return seastar::async([&ss] {
+future<> storage_service::start_gossiping(bind_messaging_port do_bind) {
+    return run_with_api_lock(sstring("start_gossiping"), [do_bind] (storage_service& ss) {
+        return seastar::async([&ss, do_bind] {
             if (!ss._initialized) {
                 slogger.warn("Starting gossip by operator request");
                 ss.set_gossip_tokens(ss.get_local_tokens().get0());
                 gms::get_local_gossiper().force_newer_generation();
-                gms::get_local_gossiper().start_gossiping(get_generation_number()).then([&ss] {
+                gms::get_local_gossiper().start_gossiping(get_generation_number(), gms::bind_messaging_port(bool(do_bind))).then([&ss] {
                     ss._initialized = true;
                 }).get();
             }
@@ -1915,7 +1989,7 @@ future<> storage_service::start_rpc_server() {
         auto addr = cfg.rpc_address();
         auto keepalive = cfg.rpc_keepalive();
         return seastar::net::dns::resolve_name(addr).then([&ss, tserver, addr, port, keepalive] (seastar::net::inet_address ip) {
-            return tserver->start(std::ref(ss._db), std::ref(cql3::get_query_processor())).then([tserver, port, addr, ip, keepalive] {
+            return tserver->start(std::ref(ss._db), std::ref(cql3::get_query_processor()), std::ref(ss._auth_service)).then([tserver, port, addr, ip, keepalive] {
                 // #293 - do not stop anything
                 //engine().at_exit([tserver] {
                 //    return tserver->stop();
@@ -1932,7 +2006,6 @@ future<> storage_service::do_stop_rpc_server() {
     auto tserver = _thrift_server;
     _thrift_server = {};
     if (tserver) {
-        // FIXME: thrift_server::stop() doesn't kill existing connections and wait for them
         // Note: We must capture tserver so that it will not be freed before tserver->stop
         return tserver->stop().then([tserver] {
             slogger.info("Thrift server stopped");
@@ -1966,8 +2039,8 @@ future<> storage_service::start_native_transport() {
         auto ceo = cfg.client_encryption_options();
         auto keepalive = cfg.rpc_keepalive();
         cql_transport::cql_load_balance lb = cql_transport::parse_load_balance(cfg.load_balance());
-        return seastar::net::dns::resolve_name(addr).then([cserver, addr, &cfg, lb, keepalive, ceo = std::move(ceo)] (seastar::net::inet_address ip) {
-            return cserver->start(std::ref(service::get_storage_proxy()), std::ref(cql3::get_query_processor()), lb).then([cserver, &cfg, addr, ip, ceo, keepalive]() {
+        return seastar::net::dns::resolve_name(addr).then([&ss, cserver, addr, &cfg, lb, keepalive, ceo = std::move(ceo)] (seastar::net::inet_address ip) {
+                return cserver->start(std::ref(service::get_storage_proxy()), std::ref(cql3::get_query_processor()), lb, std::ref(ss._auth_service)).then([cserver, &cfg, addr, ip, ceo, keepalive]() {
                 // #293 - do not stop anything
                 //engine().at_exit([cserver] {
                 //    return cserver->stop();
@@ -3123,31 +3196,36 @@ std::map<token, inet_address> storage_service::get_token_to_endpoint_map() {
 
 std::chrono::milliseconds storage_service::get_ring_delay() {
     auto ring_delay = _db.local().get_config().ring_delay_ms();
-    slogger.trace("Set RING_DELAY to {}ms", ring_delay);
+    slogger.trace("Get RING_DELAY: {}ms", ring_delay);
     return std::chrono::milliseconds(ring_delay);
 }
 
-void storage_service::do_update_pending_ranges() {
+future<> storage_service::do_update_pending_ranges() {
     if (engine().cpu_id() != 0) {
-        throw std::runtime_error("do_update_pending_ranges should be called on cpu zero");
+        return make_exception_future<>(std::runtime_error("do_update_pending_ranges should be called on cpu zero"));
     }
     // long start = System.currentTimeMillis();
-    auto keyspaces = _db.local().get_non_system_keyspaces();
-    for (auto& keyspace_name : keyspaces) {
-        auto& ks = _db.local().find_keyspace(keyspace_name);
-        auto& strategy = ks.get_replication_strategy();
-        get_local_storage_service().get_token_metadata().calculate_pending_ranges(strategy, keyspace_name);
-    }
+    return do_with(_db.local().get_non_system_keyspaces(), [this] (auto& keyspaces){
+        return do_for_each(keyspaces, [this] (auto& keyspace_name) {
+            auto& ks = this->_db.local().find_keyspace(keyspace_name);
+            auto& strategy = ks.get_replication_strategy();
+            slogger.debug("Calculating pending ranges for keyspace={} starts", keyspace_name);
+            return get_local_storage_service().get_token_metadata().calculate_pending_ranges(strategy, keyspace_name).finally([&keyspace_name] {
+                slogger.debug("Calculating pending ranges for keyspace={} ends", keyspace_name);
+            });
+        });
+    });
     // slogger.debug("finished calculation for {} keyspaces in {}ms", keyspaces.size(), System.currentTimeMillis() - start);
 }
 
 future<> storage_service::update_pending_ranges() {
     return get_storage_service().invoke_on(0, [] (auto& ss){
         ss._update_jobs++;
-        ss.do_update_pending_ranges();
-        // calculate_pending_ranges will modify token_metadata, we need to repliate to other cores
-        return ss.replicate_to_all_cores().finally([&ss, ss0 = ss.shared_from_this()] {
-            ss._update_jobs--;
+        return ss._update_pending_ranges_action.trigger_later().then([&ss] {
+            // calculate_pending_ranges will modify token_metadata, we need to repliate to other cores
+            return ss.replicate_to_all_cores().finally([&ss, ss0 = ss.shared_from_this()] {
+                ss._update_jobs--;
+            });
         });
     });
 }

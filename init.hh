@@ -23,15 +23,20 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/distributed.hh>
+#include "auth/service.hh"
 #include "db/config.hh"
 #include "database.hh"
 #include "log.hh"
+
+namespace db {
+class extensions;
+}
 
 extern logging::logger startlog;
 
 class bad_configuration_error : public std::exception {};
 
-void init_storage_service(distributed<database>& db);
+void init_storage_service(distributed<database>& db, sharded<auth::service>&);
 void init_ms_fd_gossiper(sstring listen_address
                 , uint16_t storage_port
                 , uint16_t ssl_storage_port
@@ -69,7 +74,15 @@ public:
     virtual future<> initialize(const boost::program_options::variables_map&) {
         return make_ready_future();
     }
+    virtual future<> initialize(const boost::program_options::variables_map& map, const db::config& cfg, db::extensions& exts) {
+        return initialize(map);
+    }
 
+    // visible for testing
+    static std::vector<std::reference_wrapper<configurable>>& configurables();
+    static future<> init_all(const boost::program_options::variables_map&, const db::config&, db::extensions&);
+    static future<> init_all(const db::config&, db::extensions&);
+    static void append_all(boost::program_options::options_description_easy_init&);
 private:
     static void register_configurable(configurable &);
 };

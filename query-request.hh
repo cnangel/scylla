@@ -46,6 +46,11 @@ bool is_single_partition(const dht::partition_range& range) {
     return range.is_singular() && range.start()->value().has_key();
 }
 
+inline
+bool is_single_row(const schema& s, const query::clustering_range& range) {
+    return range.is_singular() && range.start()->value().is_full(s);
+}
+
 typedef std::vector<clustering_range> clustering_row_ranges;
 
 class specific_ranges {
@@ -95,7 +100,7 @@ constexpr auto max_rows = std::numeric_limits<uint32_t>::max();
 class partition_slice {
 public:
     enum class option { send_clustering_key, send_partition_key, send_timestamp, send_expiry, reversed, distinct, collections_as_maps, send_ttl,
-                        allow_short_read, };
+                        allow_short_read, with_digest };
     using option_set = enum_set<super_enum<option,
         option::send_clustering_key,
         option::send_partition_key,
@@ -105,7 +110,8 @@ public:
         option::distinct,
         option::collections_as_maps,
         option::send_ttl,
-        option::allow_short_read>>;
+        option::allow_short_read,
+        option::with_digest>>;
     clustering_row_ranges _row_ranges;
 public:
     std::vector<column_id> static_columns; // TODO: consider using bitmap
@@ -167,6 +173,19 @@ public:
     gc_clock::time_point timestamp;
     std::experimental::optional<tracing::trace_info> trace_info;
     uint32_t partition_limit; // The maximum number of live partitions to return.
+    // The "query_uuid" field is useful in pages queries: It tells the replica
+    // that when it finishes the read request prematurely, i.e., reached the
+    // desired number of rows per page, it should not destroy the reader object,
+    // rather it should keep it alive - at its current position - and save it
+    // under the unique key "query_uuid". Later, when we want to resume
+    // the read at exactly the same position (i.e., to request the next page)
+    // we can pass this same unique id in that query's "query_uuid" field.
+    utils::UUID query_uuid;
+    // Signal to the replica that this is the first page of a (maybe) paged
+    // read request as far the replica is concerned. Can be used by the replica
+    // to avoid doing work normally done on paged requests, e.g. attempting to
+    // reused suspended readers.
+    bool is_first_page;
     api::timestamp_type read_timestamp; // not serialized
 public:
     read_command(utils::UUID cf_id,
@@ -176,6 +195,8 @@ public:
                  gc_clock::time_point now = gc_clock::now(),
                  std::experimental::optional<tracing::trace_info> ti = std::experimental::nullopt,
                  uint32_t partition_limit = max_partitions,
+                 utils::UUID query_uuid = utils::UUID(),
+                 bool is_first_page = false,
                  api::timestamp_type rt = api::missing_timestamp)
         : cf_id(std::move(cf_id))
         , schema_version(std::move(schema_version))
@@ -184,6 +205,8 @@ public:
         , timestamp(now)
         , trace_info(std::move(ti))
         , partition_limit(partition_limit)
+        , query_uuid(query_uuid)
+        , is_first_page(is_first_page)
         , read_timestamp(rt)
     { }
 

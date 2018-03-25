@@ -23,6 +23,7 @@
 
 #include <cstdlib>
 #include <seastar/core/memory.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 #include <malloc.h>
 
 // A function used by compacting collectors to migrate objects during
@@ -172,8 +173,14 @@ public:
 class standard_allocation_strategy : public allocation_strategy {
 public:
     virtual void* alloc(migrate_fn, size_t size, size_t alignment) override {
+        seastar::memory::on_alloc_point();
         // ASAN doesn't intercept aligned_alloc() and complains on free().
         void* ret;
+        // The system posix_memalign will return EINVAL if alignment is not
+        // a multiple of pointer size.
+        if (alignment < sizeof(void*)) {
+            alignment = sizeof(void*);
+        }
         if (posix_memalign(&ret, alignment, size) != 0) {
             throw std::bad_alloc();
         }

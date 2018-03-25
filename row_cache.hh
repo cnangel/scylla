@@ -23,9 +23,11 @@
 
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/set.hpp>
+#include <boost/intrusive/parent_from_member.hpp>
 
 #include "core/memory.hh"
 #include <seastar/core/thread.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include "mutation_reader.hh"
 #include "mutation_partition.hh"
@@ -36,16 +38,19 @@
 #include "utils/estimated_histogram.hh"
 #include "tracing/trace_state.hh"
 #include <seastar/core/metrics_registration.hh>
+#include "flat_mutation_reader.hh"
 
 namespace bi = boost::intrusive;
 
 class row_cache;
 class memtable_entry;
+class cache_tracker;
 
 namespace cache {
 
 class autoupdating_underlying_reader;
 class cache_streamed_mutation;
+class cache_flat_mutation_reader;
 class read_context;
 class lsa_manager;
 
@@ -57,11 +62,7 @@ class lsa_manager;
 class cache_entry {
     // We need auto_unlink<> option on the _cache_link because when entry is
     // evicted from cache via LRU we don't have a reference to the container
-    // and don't want to store it with each entry. As for the _lru_link, we
-    // have a global LRU, so technically we could not use auto_unlink<> on
-    // _lru_link, but it's convenient to do so too. We may also want to have
-    // multiple eviction spaces in the future and thus multiple LRUs.
-    using lru_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
+    // and don't want to store it with each entry.
     using cache_link_type = bi::set_member_hook<bi::link_mode<bi::auto_unlink>>;
 
     schema_ptr _schema;
@@ -72,17 +73,17 @@ class cache_entry {
         bool _continuous : 1;
         bool _dummy_entry : 1;
     } _flags{};
-    lru_link_type _lru_link;
     cache_link_type _cache_link;
     friend class size_calculator;
 
-    streamed_mutation do_read(row_cache&, cache::read_context& reader);
+    flat_mutation_reader do_read(row_cache&, cache::read_context& reader);
 public:
     friend class row_cache;
     friend class cache_tracker;
 
     struct dummy_entry_tag{};
     struct incomplete_tag{};
+    struct evictable_tag{};
 
     cache_entry(dummy_entry_tag)
         : _key{dht::token(), partition_key::make_empty()}
@@ -98,35 +99,35 @@ public:
     cache_entry(schema_ptr s, const dht::decorated_key& key, const mutation_partition& p)
         : _schema(std::move(s))
         , _key(key)
-        , _pe(p)
-    {
-        _pe.version()->partition().ensure_last_dummy(*_schema);
-    }
+        , _pe(partition_entry::make_evictable(*_schema, mutation_partition(p)))
+    { }
 
-    cache_entry(schema_ptr s, dht::decorated_key&& key, mutation_partition&& p) noexcept
-        : _schema(std::move(s))
-        , _key(std::move(key))
-        , _pe(std::move(p))
-    {
-        _pe.version()->partition().ensure_last_dummy(*_schema);
-    }
+    cache_entry(schema_ptr s, dht::decorated_key&& key, mutation_partition&& p)
+        : cache_entry(evictable_tag(), s, std::move(key),
+            partition_entry::make_evictable(*s, std::move(p)))
+    { }
 
     // It is assumed that pe is fully continuous
-    cache_entry(schema_ptr s, dht::decorated_key&& key, partition_entry&& pe) noexcept
+    // pe must be evictable.
+    cache_entry(evictable_tag, schema_ptr s, dht::decorated_key&& key, partition_entry&& pe) noexcept
         : _schema(std::move(s))
         , _key(std::move(key))
         , _pe(std::move(pe))
-    {
-        // If we can assume that _pe is fully continuous, we don't need to check all versions
-        // to determine what the continuity is.
-        // This doesn't change value and doesn't invalidate iterators, so can be called even with a snapshot.
-        _pe.version()->partition().ensure_last_dummy(*_schema);
-    }
+    { }
 
     cache_entry(cache_entry&&) noexcept;
     ~cache_entry();
 
-    bool is_evictable() { return _lru_link.is_linked(); }
+    static cache_entry& container_of(partition_entry& pe) {
+        return *boost::intrusive::get_parent_from_member(&pe, &cache_entry::_pe);
+    }
+
+    // Called when all contents have been evicted.
+    // This object should unlink and destroy itself from the container.
+    void on_evicted(cache_tracker&) noexcept;
+    // Evicts contents of this entry.
+    // The caller is still responsible for unlinking and destroying this entry.
+    void evict(cache_tracker&) noexcept;
     const dht::decorated_key& key() const { return _key; }
     dht::ring_position_view position() const {
         if (is_dummy_entry()) {
@@ -138,8 +139,8 @@ public:
     partition_entry& partition() { return _pe; }
     const schema_ptr& schema() const { return _schema; }
     schema_ptr& schema() { return _schema; }
-    streamed_mutation read(row_cache&, cache::read_context& reader);
-    streamed_mutation read(row_cache&, cache::read_context& reader, streamed_mutation&& underlying, utils::phased_barrier::phase_type);
+    flat_mutation_reader read(row_cache&, cache::read_context&);
+    flat_mutation_reader read(row_cache&, cache::read_context&, utils::phased_barrier::phase_type);
     bool continuous() const { return _flags._continuous; }
     void set_continuous(bool value) { _flags._continuous = value; }
 
@@ -183,14 +184,15 @@ public:
 // Tracks accesses and performs eviction of cache entries.
 class cache_tracker final {
 public:
-    using lru_type = bi::list<cache_entry,
-        bi::member_hook<cache_entry, cache_entry::lru_link_type, &cache_entry::_lru_link>,
+    using lru_type = bi::list<rows_entry,
+        bi::member_hook<rows_entry, rows_entry::lru_link_type, &rows_entry::_lru_link>,
         bi::constant_time_size<false>>; // we need this to have bi::auto_unlink on hooks.
 public:
     friend class row_cache;
     friend class cache::read_context;
     friend class cache::autoupdating_underlying_reader;
     friend class cache::cache_streamed_mutation;
+    friend class cache::cache_flat_mutation_reader;
     struct stats {
         uint64_t partition_hits;
         uint64_t partition_misses;
@@ -198,11 +200,18 @@ public:
         uint64_t row_misses;
         uint64_t partition_insertions;
         uint64_t row_insertions;
+        uint64_t static_row_insertions;
         uint64_t concurrent_misses_same_key;
         uint64_t partition_merges;
+        uint64_t rows_processed_from_memtable;
+        uint64_t rows_dropped_from_memtable;
+        uint64_t rows_merged_from_memtable;
         uint64_t partition_evictions;
         uint64_t partition_removals;
+        uint64_t row_evictions;
+        uint64_t row_removals;
         uint64_t partitions;
+        uint64_t rows;
         uint64_t mispopulations;
         uint64_t underlying_recreations;
         uint64_t underlying_partition_skips;
@@ -210,9 +219,10 @@ public:
         uint64_t reads;
         uint64_t reads_with_misses;
         uint64_t reads_done;
+        uint64_t pinned_dirty_memory_overload;
 
         uint64_t active_reads() const {
-            return reads_done - reads;
+            return reads - reads_done;
         }
     };
 private:
@@ -226,17 +236,28 @@ public:
     cache_tracker();
     ~cache_tracker();
     void clear();
-    void touch(cache_entry&);
+    void touch(rows_entry&);
     void insert(cache_entry&);
+    void insert(partition_entry&) noexcept;
+    void insert(partition_version&) noexcept;
+    void insert(rows_entry&) noexcept;
+    void on_remove(rows_entry&) noexcept;
+    void unlink(rows_entry&) noexcept;
     void clear_continuity(cache_entry& ce);
-    void on_erase();
-    void on_merge();
+    void on_partition_erase();
+    void on_partition_merge();
     void on_partition_hit();
     void on_partition_miss();
+    void on_partition_eviction();
+    void on_row_eviction();
     void on_row_hit();
     void on_row_miss();
     void on_miss_already_populated();
     void on_mispopulate();
+    void on_row_processed_from_memtable() { ++_stats.rows_processed_from_memtable; }
+    void on_row_dropped_from_memtable() { ++_stats.rows_dropped_from_memtable; }
+    void on_row_merged_from_memtable() { ++_stats.rows_merged_from_memtable; }
+    void pinned_dirty_memory_overload(uint64_t bytes);
     allocation_strategy& allocator();
     logalloc::region& region();
     const logalloc::region& region() const;
@@ -270,6 +291,7 @@ public:
     friend class single_partition_populating_reader;
     friend class cache_entry;
     friend class cache::cache_streamed_mutation;
+    friend class cache::cache_flat_mutation_reader;
     friend class cache::lsa_manager;
     friend class cache::read_context;
     friend class partition_range_cursor;
@@ -279,7 +301,7 @@ public:
     // All invocations of external_updater on given cache instance are serialized internally.
     // Must have strong exception guarantees. If throws, the underlying mutation source
     // must be left in the state in which it was before the call.
-    using external_updater = std::function<void()>;
+    using external_updater = seastar::noncopyable_function<void()>;
 public:
     struct stats {
         utils::timed_rate_moving_average hits;
@@ -334,19 +356,18 @@ private:
     logalloc::allocating_section _update_section;
     logalloc::allocating_section _populate_section;
     logalloc::allocating_section _read_section;
-    mutation_reader create_underlying_reader(cache::read_context&, mutation_source&, const dht::partition_range&);
-    mutation_reader make_scanning_reader(const dht::partition_range&, lw_shared_ptr<cache::read_context>);
+    flat_mutation_reader create_underlying_reader(cache::read_context&, mutation_source&, const dht::partition_range&);
+    flat_mutation_reader make_scanning_reader(const dht::partition_range&, lw_shared_ptr<cache::read_context>);
     void on_partition_hit();
     void on_partition_miss();
     void on_row_hit();
     void on_row_miss();
-    void on_row_insert();
+    void on_static_row_insert();
     void on_mispopulate();
     void upgrade_entry(cache_entry&);
     void invalidate_locked(const dht::decorated_key&);
     void invalidate_unwrapped(const dht::partition_range&);
     void clear_now() noexcept;
-    static thread_local seastar::thread_scheduling_group _update_thread_scheduling_group;
 
     struct previous_entry_pointer {
         stdx::optional<dht::decorated_key> _key;
@@ -437,15 +458,15 @@ public:
     // User needs to ensure that the row_cache object stays alive
     // as long as the reader is used.
     // The range must not wrap around.
-    mutation_reader make_reader(schema_ptr,
-                                const dht::partition_range&,
-                                const query::partition_slice&,
-                                const io_priority_class& = default_priority_class(),
-                                tracing::trace_state_ptr trace_state = nullptr,
-                                streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
-                                mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
+    flat_mutation_reader make_reader(schema_ptr,
+                                     const dht::partition_range&,
+                                     const query::partition_slice&,
+                                     const io_priority_class& = default_priority_class(),
+                                     tracing::trace_state_ptr trace_state = nullptr,
+                                     streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
+                                     mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
 
-    mutation_reader make_reader(schema_ptr s, const dht::partition_range& range = query::full_partition_range) {
+    flat_mutation_reader make_reader(schema_ptr s, const dht::partition_range& range = query::full_partition_range) {
         auto& full_slice = s->full_slice();
         return make_reader(std::move(s), range, full_slice);
     }
@@ -475,6 +496,10 @@ public:
 
     // Moves given partition to the front of LRU if present in cache.
     void touch(const dht::decorated_key&);
+
+    // Detaches current contents of given partition from LRU, so
+    // that they are not evicted by memory reclaimer.
+    void unlink_from_lru(const dht::decorated_key&);
 
     // Synchronizes cache with the underlying mutation source
     // by invalidating ranges which were modified. This will force
@@ -521,3 +546,46 @@ public:
     friend class cache_tracker;
     friend class mark_end_as_continuous;
 };
+
+namespace cache {
+
+class lsa_manager {
+    row_cache &_cache;
+public:
+    lsa_manager(row_cache &cache) : _cache(cache) {}
+
+    template<typename Func>
+    decltype(auto) run_in_read_section(const Func &func) {
+        return _cache._read_section(_cache._tracker.region(), [&func]() {
+            return with_linearized_managed_bytes([&func]() {
+                return func();
+            });
+        });
+    }
+
+    template<typename Func>
+    decltype(auto) run_in_update_section(const Func &func) {
+        return _cache._update_section(_cache._tracker.region(), [&func]() {
+            return with_linearized_managed_bytes([&func]() {
+                return func();
+            });
+        });
+    }
+
+    template<typename Func>
+    void run_in_update_section_with_allocator(Func &&func) {
+        return _cache._update_section(_cache._tracker.region(), [this, &func]() {
+            return with_linearized_managed_bytes([this, &func]() {
+                return with_allocator(_cache._tracker.region().allocator(), [this, &func]() mutable {
+                    return func();
+                });
+            });
+        });
+    }
+
+    logalloc::region &region() { return _cache._tracker.region(); }
+
+    logalloc::allocating_section &read_section() { return _cache._read_section; }
+};
+
+}

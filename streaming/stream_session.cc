@@ -266,7 +266,7 @@ void stream_session::received_failed_complete_message() {
 }
 
 void stream_session::abort() {
-    sslog.info("[Stream #{}] Aborted stream session, peer={}", plan_id(), peer);
+    sslog.info("[Stream #{}] Aborted stream session={}, peer={}, is_initialized={}", plan_id(), this, peer, is_initialized());
     close_session(stream_session_state::FAILED);
 }
 
@@ -358,7 +358,17 @@ void stream_session::transfer_task_completed(UUID cf_id) {
     maybe_completed();
 }
 
+void stream_session::transfer_task_completed_all() {
+    _transfers.clear();
+    sslog.debug("[Stream #{}] transfer task_completed: all done, stream_receive_task.size={} stream_transfer_task.size={}",
+        plan_id(), _receivers.size(), _transfers.size());
+    maybe_completed();
+}
+
 void stream_session::send_failed_complete_message() {
+    if (!is_initialized()) {
+        return;
+    }
     auto plan_id = this->plan_id();
     if (_received_failed_complete_message) {
         sslog.debug("[Stream #{}] Skip sending failed message back to peer", plan_id);
@@ -401,11 +411,15 @@ void stream_session::start_streaming_files() {
     if (!_transfers.empty()) {
         set_state(stream_session_state::STREAMING);
     }
-    for (auto it = _transfers.begin(); it != _transfers.end();) {
-        stream_transfer_task& task = it->second;
-        it++;
-        task.start();
-    }
+    do_for_each(_transfers.begin(), _transfers.end(), [this] (auto& item) {
+        sslog.debug("[Stream #{}] Start to send cf_id={}", this->plan_id(), item.first);
+        return item.second.execute();
+    }).then([this] {
+        this->transfer_task_completed_all();
+    }).handle_exception([this] (auto ep) {
+        sslog.warn("[Stream #{}] Failed to send: {}", this->plan_id(), ep);
+        this->on_error();
+    });
 }
 
 std::vector<column_family*> stream_session::get_column_family_stores(const sstring& keyspace, const std::vector<sstring>& column_families) {
@@ -512,6 +526,10 @@ void stream_session::start() {
     on_initialization_complete().handle_exception([this] (auto ep) {
         this->on_error();
     });
+}
+
+bool stream_session::is_initialized() const {
+    return bool(_stream_result);
 }
 
 void stream_session::init(shared_ptr<stream_result_future> stream_result_) {

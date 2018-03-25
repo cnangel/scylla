@@ -56,9 +56,9 @@ namespace db {
 
 extern logging::logger cl_logger;
 
-size_t quorum_for(keyspace& ks);
+size_t quorum_for(const keyspace& ks);
 
-size_t local_quorum_for(keyspace& ks, const sstring& dc);
+size_t local_quorum_for(const keyspace& ks, const sstring& dc);
 
 size_t block_for_local_serial(keyspace& ks);
 
@@ -79,7 +79,10 @@ std::vector<gms::inet_address>
 filter_for_query(consistency_level cl,
                  keyspace& ks,
                  std::vector<gms::inet_address> live_endpoints,
-                 read_repair_decision read_repair, gms::inet_address* extra, column_family* cf);
+                 const std::vector<gms::inet_address>& preferred_endpoints,
+                 read_repair_decision read_repair,
+                 gms::inet_address* extra,
+                 column_family* cf);
 
 std::vector<gms::inet_address> filter_for_query(consistency_level cl, keyspace& ks, std::vector<gms::inet_address>& live_endpoints, column_family* cf);
 

@@ -5,7 +5,6 @@ print_usage() {
     echo "build_deb.sh -target <codename> --dist --rebuild-dep"
     echo "  --target target distribution codename"
     echo "  --dist  create a public distribution package"
-    echo "  --rebuild-dep  rebuild dependency packages"
     echo "  --no-clean  don't rebuild pbuilder tgz"
     exit 1
 }
@@ -17,16 +16,11 @@ install_deps() {
     sudo dpkg -P ${DEB_FILE%%_*.deb}
 }
 
-REBUILD=0
 DIST=0
 TARGET=
 NO_CLEAN=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        "--rebuild-dep")
-            REBUILD=1
-            shift 1
-            ;;
         "--dist")
             DIST=1
             shift 1
@@ -111,11 +105,6 @@ if [ -z "$TARGET" ]; then
         exit 1
     fi
 fi
-if [ $REBUILD -eq 1 ] && [ "$TARGET" != "$CODENAME" ]; then
-    echo "Rebuild dependencies doesn't support cross-build."
-    echo "Please run it on following distribution: $TARGET"
-    exit 1
-fi
 
 VERSION=$(./SCYLLA-VERSION-GEN)
 SCYLLA_VERSION=$(cat build/SCYLLA-VERSION-FILE | sed 's/\.rc/~rc/')
@@ -135,11 +124,14 @@ cp dist/debian/scylla-server.install.in debian/scylla-server.install
 cp dist/debian/scylla-conf.preinst.in debian/scylla-conf.preinst
 sed -i -e "s/@@VERSION@@/$SCYLLA_VERSION/g" debian/scylla-conf.preinst
 if [ "$TARGET" = "jessie" ]; then
-    cp dist/debian/scylla-server.cron.d debian/
     sed -i -e "s/@@REVISION@@/1~$TARGET/g" debian/changelog
     sed -i -e "s/@@DH_INSTALLINIT@@//g" debian/rules
-    sed -i -e "s/@@COMPILER@@/g++-5/g" debian/rules
-    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, g++-5, libunwind-dev, antlr3, libthrift-dev, antlr3-c++-dev/g" debian/control
+    sed -i -e "s/@@INSTALL_HK_DAILY_INIT@@/dh_installinit --no-start --name scylla-housekeeping-daily/g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_RESTART_INIT@@/dh_installinit --no-start --name scylla-housekeeping-restart/g" debian/rules
+    sed -i -e "s/@@INSTALL_FSTRIM@@/dh_installinit --no-start --name scylla-fstrim/g" debian/rules
+    sed -i -e "s/@@INSTALL_NODE_EXPORTER@@/dh_installinit --no-start --name node-exporter/g" debian/rules
+    sed -i -e "s#@@COMPILER@@#/opt/scylladb/bin/g++-7#g" debian/rules
+    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, scylla-gcc73-g++-7, libunwind-dev, scylla-antlr35, scylla-libthrift010-dev, scylla-antlr35-c++-dev, scylla-libboost-program-options165-dev, scylla-libboost-filesystem165-dev, scylla-libboost-system165-dev, scylla-libboost-thread165-dev, scylla-libboost-test165-dev, libyaml-cpp-dev/g" debian/control
     sed -i -e "s/@@DEPENDS@@//g" debian/control
     sed -i -e "s#@@INSTALL@@##g" debian/scylla-server.install
     sed -i -e "s#@@HKDOTTIMER_D@@#dist/common/systemd/scylla-housekeeping-daily.timer /lib/systemd/system#g" debian/scylla-server.install
@@ -148,16 +140,20 @@ if [ "$TARGET" = "jessie" ]; then
     sed -i -e "s#@@SYSCTL@@#dist/debian/sysctl.d/99-scylla.conf etc/sysctl.d#g" debian/scylla-server.install
     sed -i -e "s#@@SCRIPTS_SAVE_COREDUMP@@#dist/debian/scripts/scylla_save_coredump usr/lib/scylla#g" debian/scylla-server.install
     sed -i -e "s#@@SCRIPTS_DELAY_FSTRIM@@#dist/debian/scripts/scylla_delay_fstrim usr/lib/scylla#g" debian/scylla-server.install
-elif [ "$TARGET" = "stretch" ] || [ "$TARGET" = "buster" ] || [ "$TARGET" = "sid" ]; then
-    cp dist/debian/scylla-server.cron.d debian/
+elif [ "$TARGET" = "stretch" ]; then
     sed -i -e "s/@@REVISION@@/1~$TARGET/g" debian/changelog
     sed -i -e "s/@@DH_INSTALLINIT@@//g" debian/rules
-    sed -i -e "s/@@COMPILER@@/g++/g" debian/rules
-    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, g++, libunwind8-dev, antlr3, libthrift-dev, antlr3-c++-dev/g" debian/control
+    sed -i -e "s/@@INSTALL_HK_DAILY_INIT@@/dh_installinit --no-start --name scylla-housekeeping-daily/g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_RESTART_INIT@@/dh_installinit --no-start --name scylla-housekeeping-restart/g" debian/rules
+    sed -i -e "s/@@INSTALL_FSTRIM@@/dh_installinit --no-start --name scylla-fstrim/g" debian/rules
+    sed -i -e "s/@@INSTALL_NODE_EXPORTER@@/dh_installinit --no-start --name node-exporter/g" debian/rules
+    sed -i -e "s#@@COMPILER@@#/opt/scylladb/bin/g++-7#g" debian/rules
+    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, scylla-gcc73-g++-7, libunwind-dev, antlr3, scylla-libthrift010-dev, scylla-antlr35-c++-dev, scylla-libboost-program-options165-dev, scylla-libboost-filesystem165-dev, scylla-libboost-system165-dev, scylla-libboost-thread165-dev, scylla-libboost-test165-dev, scylla-libyaml-cpp05-dev/g" debian/control
     sed -i -e "s/@@DEPENDS@@//g" debian/control
     sed -i -e "s#@@INSTALL@@##g" debian/scylla-server.install
     sed -i -e "s#@@HKDOTTIMER_D@@#dist/common/systemd/scylla-housekeeping-daily.timer /lib/systemd/system#g" debian/scylla-server.install
     sed -i -e "s#@@HKDOTTIMER_R@@#dist/common/systemd/scylla-housekeeping-restart.timer /lib/systemd/system#g" debian/scylla-server.install
+    sed -i -e "s#@@FTDOTTIMER@@#dist/common/systemd/scylla-fstrim.timer /lib/systemd/system#g" debian/scylla-server.install
     sed -i -e "s#@@SYSCTL@@#dist/debian/sysctl.d/99-scylla.conf etc/sysctl.d#g" debian/scylla-server.install
     sed -i -e "s#@@SCRIPTS_SAVE_COREDUMP@@#dist/debian/scripts/scylla_save_coredump usr/lib/scylla#g" debian/scylla-server.install
     sed -i -e "s#@@SCRIPTS_DELAY_FSTRIM@@#dist/debian/scripts/scylla_delay_fstrim usr/lib/scylla#g" debian/scylla-server.install
@@ -165,8 +161,12 @@ elif [ "$TARGET" = "trusty" ]; then
     cp dist/debian/scylla-server.cron.d debian/
     sed -i -e "s/@@REVISION@@/0ubuntu1~$TARGET/g" debian/changelog
     sed -i -e "s/@@DH_INSTALLINIT@@/--upstart-only/g" debian/rules
-    sed -i -e "s/@@COMPILER@@/g++-7/g" debian/rules
-    sed -i -e "s/@@BUILD_DEPENDS@@/g++-7, libunwind8-dev, scylla-antlr35, scylla-libthrift010-dev, scylla-antlr35-c++-dev/g" debian/control
+    sed -i -e "s/@@INSTALL_HK_DAILY_INIT@@/dh_installinit --no-start --name scylla-housekeeping --upstart-only/g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_RESTART_INIT@@//g" debian/rules
+    sed -i -e "s/@@INSTALL_FSTRIM@@//g" debian/rules
+    sed -i -e "s/@@INSTALL_NODE_EXPORTER@@//g" debian/rules
+    sed -i -e "s#@@COMPILER@@#/opt/scylladb/bin/g++-7#g" debian/rules
+    sed -i -e "s/@@BUILD_DEPENDS@@/scylla-gcc73-g++-7, libunwind8-dev, scylla-antlr35, scylla-libthrift010-dev, scylla-antlr35-c++-dev, scylla-libboost-program-options165-dev, scylla-libboost-filesystem165-dev, scylla-libboost-system165-dev, scylla-libboost-thread165-dev, scylla-libboost-test165-dev, libyaml-cpp-dev/g" debian/control
     sed -i -e "s/@@DEPENDS@@/hugepages, num-utils/g" debian/control
     sed -i -e "s#@@INSTALL@@#dist/debian/sudoers.d/scylla etc/sudoers.d#g" debian/scylla-server.install
     sed -i -e "s#@@HKDOTTIMER_D@@##g" debian/scylla-server.install
@@ -175,11 +175,49 @@ elif [ "$TARGET" = "trusty" ]; then
     sed -i -e "s#@@SYSCTL@@#dist/debian/sysctl.d/99-scylla.conf etc/sysctl.d#g" debian/scylla-server.install
     sed -i -e "s#@@SCRIPTS_SAVE_COREDUMP@@#dist/debian/scripts/scylla_save_coredump usr/lib/scylla#g" debian/scylla-server.install
     sed -i -e "s#@@SCRIPTS_DELAY_FSTRIM@@#dist/debian/scripts/scylla_delay_fstrim usr/lib/scylla#g" debian/scylla-server.install
-elif [ "$TARGET" = "xenial" ] || [ "$TARGET" = "yakkety" ] || [ "$TARGET" = "zesty" ] || [ "$TARGET" = "artful" ]; then
+elif [ "$TARGET" = "xenial" ]; then
     sed -i -e "s/@@REVISION@@/0ubuntu1~$TARGET/g" debian/changelog
     sed -i -e "s/@@DH_INSTALLINIT@@//g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_DAILY_INIT@@/dh_installinit --no-start --name scylla-housekeeping-daily/g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_RESTART_INIT@@/dh_installinit --no-start --name scylla-housekeeping-restart/g" debian/rules
+    sed -i -e "s/@@INSTALL_FSTRIM@@/dh_installinit --no-start --name scylla-fstrim/g" debian/rules
+    sed -i -e "s/@@INSTALL_NODE_EXPORTER@@/dh_installinit --no-start --name node-exporter/g" debian/rules
+    sed -i -e "s#@@COMPILER@@#/opt/scylladb/bin/g++-7#g" debian/rules
+    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, scylla-gcc73-g++-7, libunwind-dev, antlr3, scylla-libthrift010-dev, scylla-antlr35-c++-dev, scylla-libboost-program-options165-dev, scylla-libboost-filesystem165-dev, scylla-libboost-system165-dev, scylla-libboost-thread165-dev, scylla-libboost-test165-dev, libyaml-cpp-dev/g" debian/control
+    sed -i -e "s/@@DEPENDS@@/hugepages, /g" debian/control
+    sed -i -e "s#@@INSTALL@@##g" debian/scylla-server.install
+    sed -i -e "s#@@HKDOTTIMER_D@@#dist/common/systemd/scylla-housekeeping-daily.timer /lib/systemd/system#g" debian/scylla-server.install
+    sed -i -e "s#@@HKDOTTIMER_R@@#dist/common/systemd/scylla-housekeeping-restart.timer /lib/systemd/system#g" debian/scylla-server.install
+    sed -i -e "s#@@FTDOTTIMER@@#dist/common/systemd/scylla-fstrim.timer /lib/systemd/system#g" debian/scylla-server.install
+    sed -i -e "s#@@SYSCTL@@##g" debian/scylla-server.install
+    sed -i -e "s#@@SCRIPTS_SAVE_COREDUMP@@##g" debian/scylla-server.install
+    sed -i -e "s#@@SCRIPTS_DELAY_FSTRIM@@##g" debian/scylla-server.install
+elif [ "$TARGET" = "bionic" ]; then
+    sed -i -e "s/@@REVISION@@/0ubuntu1~$TARGET/g" debian/changelog
+    sed -i -e "s/@@DH_INSTALLINIT@@//g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_DAILY_INIT@@/dh_installinit --no-start --name scylla-housekeeping-daily/g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_RESTART_INIT@@/dh_installinit --no-start --name scylla-housekeeping-restart/g" debian/rules
+    sed -i -e "s/@@INSTALL_FSTRIM@@/dh_installinit --no-start --name scylla-fstrim/g" debian/rules
+    sed -i -e "s/@@INSTALL_NODE_EXPORTER@@/dh_installinit --no-start --name node-exporter/g" debian/rules
+    sed -i -e "s#@@COMPILER@@#g++-7#g" debian/rules
+    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, scylla-gcc73-g++-7, libunwind-dev, antlr3, scylla-libthrift010-dev, scylla-antlr35-c++-dev, scylla-libboost-program-options165-dev, scylla-libboost-filesystem165-dev, scylla-libboost-system165-dev, scylla-libboost-thread165-dev, scylla-libboost-test165-dev, libyaml-cpp-dev/g" debian/control
+    sed -i -e "s/@@DEPENDS@@/hugepages, /g" debian/control
+    sed -i -e "s#@@INSTALL@@##g" debian/scylla-server.install
+    sed -i -e "s#@@HKDOTTIMER_D@@#dist/common/systemd/scylla-housekeeping-daily.timer /lib/systemd/system#g" debian/scylla-server.install
+    sed -i -e "s#@@HKDOTTIMER_R@@#dist/common/systemd/scylla-housekeeping-restart.timer /lib/systemd/system#g" debian/scylla-server.install
+    sed -i -e "s#@@FTDOTTIMER@@#dist/common/systemd/scylla-fstrim.timer /lib/systemd/system#g" debian/scylla-server.install
+    sed -i -e "s#@@SYSCTL@@##g" debian/scylla-server.install
+    sed -i -e "s#@@SCRIPTS_SAVE_COREDUMP@@##g" debian/scylla-server.install
+    sed -i -e "s#@@SCRIPTS_DELAY_FSTRIM@@##g" debian/scylla-server.install
+elif [ "$TARGET" = "yakkety" ] || [ "$TARGET" = "zesty" ] || [ "$TARGET" = "artful" ]; then
+    sed -i -e "s/@@REVISION@@/0ubuntu1~$TARGET/g" debian/changelog
+    sed -i -e "s/@@DH_INSTALLINIT@@//g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_DAILY_INIT@@/dh_installinit --no-start --name scylla-housekeeping-daily/g" debian/rules
+    sed -i -e "s/@@INSTALL_HK_RESTART_INIT@@/dh_installinit --no-start --name scylla-housekeeping-restart/g" debian/rules
+    sed -i -e "s/@@INSTALL_FSTRIM@@/dh_installinit --no-start --name scylla-fstrim/g" debian/rules
+    sed -i -e "s/@@INSTALL_NODE_EXPORTER@@/dh_installinit --no-start --name node-exporter/g" debian/rules
     sed -i -e "s/@@COMPILER@@/g++-7/g" debian/rules
-    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, g++-7, libunwind-dev, antlr3, scylla-libthrift010-dev, scylla-antlr35-c++-dev/g" debian/control
+    sed -i -e "s/@@BUILD_DEPENDS@@/libsystemd-dev, g++-7, libunwind-dev, antlr3, scylla-libthrift010-dev, scylla-antlr35-c++-dev, libboost-program-options-dev, libboost-filesystem-dev, libboost-system-dev, libboost-thread-dev, libboost-test-dev, libyaml-cpp-dev/g" debian/control
     sed -i -e "s/@@DEPENDS@@/hugepages, /g" debian/control
     sed -i -e "s#@@INSTALL@@##g" debian/scylla-server.install
     sed -i -e "s#@@HKDOTTIMER_D@@#dist/common/systemd/scylla-housekeeping-daily.timer /lib/systemd/system#g" debian/scylla-server.install
@@ -196,25 +234,27 @@ if [ $DIST -gt 0 ]; then
 else
     sed -i -e "s#@@ADDHKCFG@@##g" debian/scylla-server.install
 fi
-cp dist/common/systemd/scylla-server.service.in debian/scylla-server.service
-sed -i -e "s#@@SYSCONFDIR@@#/etc/default#g" debian/scylla-server.service
-cp dist/common/systemd/scylla-housekeeping-daily.service debian/scylla-server.scylla-housekeeping-daily.service
-cp dist/common/systemd/scylla-housekeeping-restart.service debian/scylla-server.scylla-housekeeping-restart.service
-cp dist/common/systemd/scylla-fstrim.service debian/scylla-server.scylla-fstrim.service
-cp dist/common/systemd/node-exporter.service debian/scylla-server.node-exporter.service
-
-if [ $REBUILD -eq 1 ]; then
-    ./dist/debian/dep/build_dependency.sh
+if [ "$TARGET" != "trusty" ]; then
+    cp dist/common/systemd/scylla-server.service.in debian/scylla-server.service
+    sed -i -e "s#@@SYSCONFDIR@@#/etc/default#g" debian/scylla-server.service
+    cp dist/common/systemd/scylla-housekeeping-daily.service.in debian/scylla-server.scylla-housekeeping-daily.service
+    sed -i -e "s#@@REPOFILES@@#'/etc/apt/sources.list.d/scylla*.list'#g" debian/scylla-server.scylla-housekeeping-daily.service
+    cp dist/common/systemd/scylla-housekeeping-restart.service.in debian/scylla-server.scylla-housekeeping-restart.service
+    sed -i -e "s#@@REPOFILES@@#'/etc/apt/sources.list.d/scylla*.list'#g" debian/scylla-server.scylla-housekeeping-restart.service
+    cp dist/common/systemd/scylla-fstrim.service debian/scylla-server.scylla-fstrim.service
+    cp dist/common/systemd/node-exporter.service debian/scylla-server.node-exporter.service
 fi
 
 cp ./dist/debian/pbuilderrc ~/.pbuilderrc
 if [ $NO_CLEAN -eq 0 ]; then
     sudo rm -fv /var/cache/pbuilder/scylla-server-$TARGET.tgz
-    sudo -E DIST=$TARGET REBUILD=$REBUILD /usr/sbin/pbuilder clean
-    sudo -E DIST=$TARGET REBUILD=$REBUILD /usr/sbin/pbuilder create
+    sudo -E DIST=$TARGET /usr/sbin/pbuilder clean
+    sudo -E DIST=$TARGET /usr/sbin/pbuilder create --allow-untrusted
 fi
-sudo -E DIST=$TARGET REBUILD=$REBUILD /usr/sbin/pbuilder update
-if [ $REBUILD -eq 1 ]; then
-    sudo -E DIST=$TARGET REBUILD=$REBUILD /usr/sbin/pbuilder execute --save-after-exec dist/debian/dep/pbuilder_install_deps.sh
+sudo -E DIST=$TARGET /usr/sbin/pbuilder update --allow-untrusted
+if [ "$TARGET" = "trusty" ] || [ "$TARGET" = "xenial" ] || [ "$TARGET" = "yakkety" ] || [ "$TARGET" = "zesty" ] || [ "$TARGET" = "artful" ] || [ "$TARGET" = "bionic" ]; then
+    sudo -E DIST=$TARGET /usr/sbin/pbuilder execute --save-after-exec dist/debian/ubuntu_enable_ppa.sh
+elif [ "$TARGET" = "jessie" ] || [ "$TARGET" = "stretch" ]; then
+    sudo -E DIST=$TARGET /usr/sbin/pbuilder execute --save-after-exec dist/debian/debian_install_gpgkey.sh
 fi
-sudo -E DIST=$TARGET REBUILD=$REBUILD pdebuild --buildresult build/debs
+sudo -E DIST=$TARGET pdebuild --buildresult build/debs

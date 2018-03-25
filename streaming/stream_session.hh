@@ -150,7 +150,7 @@ public:
      * Each {@code StreamSession} is identified by this InetAddress which is broadcast address of the node streaming.
      */
     inet_address peer;
-    unsigned dst_cpu_id;
+    unsigned dst_cpu_id = 0;
 private:
     // should not be null when session is started
     shared_ptr<stream_result_future> _stream_result;
@@ -175,10 +175,10 @@ private:
     bool _complete_sent = false;
     bool _received_failed_complete_message = false;
 
-    // If the session is idle for 300 minutes, close the session
-    std::chrono::seconds _keep_alive_timeout{60 * 300};
-    // Check every 10 minutes
-    std::chrono::seconds _keep_alive_interval{60 * 10};
+    // If the session is idle for 10 minutes, close the session
+    std::chrono::seconds _keep_alive_timeout{60 * 10};
+    // Check every 1 minutes
+    std::chrono::seconds _keep_alive_interval{60};
     timer<lowres_clock> _keep_alive;
     stream_bytes _last_stream_bytes;
     lowres_clock::time_point _last_stream_progress;
@@ -230,6 +230,8 @@ public:
     void init(shared_ptr<stream_result_future> stream_result_);
 
     void start();
+
+    bool is_initialized() const;
 
     /**
      * Request data fetch task to this session.
@@ -332,6 +334,7 @@ public:
 
     void receive_task_completed(UUID cf_id);
     void transfer_task_completed(UUID cf_id);
+    void transfer_task_completed_all();
 private:
     void send_failed_complete_message();
     bool maybe_completed();

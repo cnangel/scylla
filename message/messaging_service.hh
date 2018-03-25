@@ -22,6 +22,7 @@
 #pragma once
 
 #include "messaging_service_fwd.hh"
+#include "msg_addr.hh"
 #include "core/reactor.hh"
 #include "core/distributed.hh"
 #include "core/sstring.hh"
@@ -108,7 +109,8 @@ enum class messaging_verb : int32_t {
     GET_SCHEMA_VERSION = 21,
     SCHEMA_CHECK = 22,
     COUNTER_MUTATION = 23,
-    LAST = 24,
+    MUTATION_FAILED = 24,
+    LAST = 25,
 };
 
 } // namespace netw
@@ -126,17 +128,6 @@ public:
 namespace netw {
 
 struct serializer {};
-
-struct msg_addr {
-    gms::inet_address addr;
-    uint32_t cpu_id;
-    friend bool operator==(const msg_addr& x, const msg_addr& y);
-    friend bool operator<(const msg_addr& x, const msg_addr& y);
-    friend std::ostream& operator<<(std::ostream& os, const msg_addr& x);
-    struct hash {
-        size_t operator()(const msg_addr& id) const;
-    };
-};
 
 class messaging_service : public seastar::async_sharded_service<messaging_service> {
 public:
@@ -311,9 +302,14 @@ public:
     void unregister_mutation_done();
     future<> send_mutation_done(msg_addr id, unsigned shard, response_id_type response_id);
 
+    // Wrapper for MUTATION_FAILED
+    void register_mutation_failed(std::function<future<rpc::no_wait_type> (const rpc::client_info& cinfo, unsigned shard, response_id_type response_id, size_t num_failed)>&& func);
+    void unregister_mutation_failed();
+    future<> send_mutation_failed(msg_addr id, unsigned shard, response_id_type response_id, size_t num_failed);
+
     // Wrapper for READ_DATA
     // Note: WTH is future<foreign_ptr<lw_shared_ptr<query::result>>
-    void register_read_data(std::function<future<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature> (const rpc::client_info&, query::read_command cmd, compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> digest)>&& func);
+    void register_read_data(std::function<future<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature> (const rpc::client_info&, rpc::opt_time_point timeout, query::read_command cmd, compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> digest)>&& func);
     void unregister_read_data();
     future<query::result, rpc::optional<cache_temperature>> send_read_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr, query::digest_algorithm da);
 
@@ -328,14 +324,14 @@ public:
     future<utils::UUID> send_schema_check(msg_addr);
 
     // Wrapper for READ_MUTATION_DATA
-    void register_read_mutation_data(std::function<future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> (const rpc::client_info&, query::read_command cmd, compat::wrapping_partition_range pr)>&& func);
+    void register_read_mutation_data(std::function<future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> (const rpc::client_info&, rpc::opt_time_point timeout, query::read_command cmd, compat::wrapping_partition_range pr)>&& func);
     void unregister_read_mutation_data();
     future<reconcilable_result, rpc::optional<cache_temperature>> send_read_mutation_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr);
 
     // Wrapper for READ_DIGEST
-    void register_read_digest(std::function<future<query::result_digest, api::timestamp_type, cache_temperature> (const rpc::client_info&, query::read_command cmd, compat::wrapping_partition_range pr)>&& func);
+    void register_read_digest(std::function<future<query::result_digest, api::timestamp_type, cache_temperature> (const rpc::client_info&, rpc::opt_time_point timeout, query::read_command cmd, compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> digest)>&& func);
     void unregister_read_digest();
-    future<query::result_digest, rpc::optional<api::timestamp_type>, rpc::optional<cache_temperature>> send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr);
+    future<query::result_digest, rpc::optional<api::timestamp_type>, rpc::optional<cache_temperature>> send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr, query::digest_algorithm da);
 
     // Wrapper for TRUNCATE
     void register_truncate(std::function<future<>(sstring, sstring)>&& func);

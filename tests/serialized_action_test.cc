@@ -21,21 +21,20 @@
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/thread.hh>
+#include <seastar/core/semaphore.hh>
 #include "utils/serialized_action.hh"
 #include "tests/test-utils.hh"
 #include "utils/phased_barrier.hh"
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
 
 SEASTAR_TEST_CASE(test_serialized_action_triggering) {
     return seastar::async([] {
         int current = 0;
         std::vector<int> history;
         promise<> p;
+        seastar::semaphore sem{0};
 
         serialized_action act([&] {
+            sem.signal(1);
             auto val = current;
             return p.get_future().then([&, val] {
                 history.push_back(val);
@@ -47,7 +46,7 @@ SEASTAR_TEST_CASE(test_serialized_action_triggering) {
         };
 
         auto t1 = act.trigger();
-        later().get(); // wait for t1 action to block
+        sem.wait().get(); // wait for t1 action to block
         current = 1;
         auto t2 = act.trigger();
         auto t3 = act.trigger();
@@ -61,7 +60,7 @@ SEASTAR_TEST_CASE(test_serialized_action_triggering) {
         BOOST_REQUIRE(!t2.available());
         BOOST_REQUIRE(!t3.available());
 
-        later().get(); // wait for t2 action to block
+        sem.wait().get(); // wait for t2 action to block
         current = 3;
         auto t4 = act.trigger();
         release();
@@ -72,7 +71,7 @@ SEASTAR_TEST_CASE(test_serialized_action_triggering) {
         BOOST_REQUIRE(history.back() == 2);
         BOOST_REQUIRE(!t4.available());
 
-        later().get(); // wait for t4 action to block
+        sem.wait().get(); // wait for t4 action to block
         current = 4;
         release();
 
@@ -82,7 +81,7 @@ SEASTAR_TEST_CASE(test_serialized_action_triggering) {
 
         current = 5;
         auto t5 = act.trigger();
-        later().get(); // wait for t5 action to block
+        sem.wait().get(); // wait for t5 action to block
         release();
         t5.get();
 

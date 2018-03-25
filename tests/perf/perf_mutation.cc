@@ -24,11 +24,6 @@
 #include "perf.hh"
 #include <seastar/core/app-template.hh>
 
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
-
 static atomic_cell make_atomic_cell(bytes value) {
     return atomic_cell::make_live(0, value);
 };
@@ -47,7 +42,7 @@ int main(int argc, char* argv[]) {
         bytes value = int32_type->decompose(3);
 
         time_it([&] {
-            mutation m(key, s);
+            mutation m(s, key);
             const column_definition& col = *s->get_column_definition("r1");
             m.set_clustered_cell(c_key, col, make_atomic_cell(value));
             mt.apply(std::move(m));

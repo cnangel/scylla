@@ -44,6 +44,7 @@
 #include <boost/range/numeric.hpp>
 #include <boost/range/combine.hpp>
 #include "net/ip.hh"
+#include "util/backtrace.hh"
 #include "hashing.hh"
 #include <boost/multiprecision/cpp_int.hpp>  // FIXME: remove somehow
 #include "stdx.hh"
@@ -320,7 +321,18 @@ class abstract_type;
 class data_value;
 
 struct simple_date_native_type {
-    uint32_t days;
+    using primary_type = uint32_t;
+    primary_type days;
+};
+
+struct timestamp_native_type {
+    using primary_type = db_clock::time_point;
+    primary_type tp;
+};
+
+struct timeuuid_native_type {
+    using primary_type = utils::UUID;
+    primary_type uuid;
 };
 
 using data_type = shared_ptr<const abstract_type>;
@@ -359,6 +371,8 @@ public:
     data_value(double);
     data_value(net::ipv4_address);
     data_value(simple_date_native_type);
+    data_value(timestamp_native_type);
+    data_value(timeuuid_native_type);
     data_value(db_clock::time_point);
     data_value(boost::multiprecision::cpp_int);
     data_value(big_decimal);
@@ -810,7 +824,7 @@ public:
     // Calls Func(atomic_cell_view) for each cell in this collection.
     // noexcept if Func doesn't throw.
     template<typename Func>
-    void for_each_cell(collection_mutation_view c, Func&& func) const {
+    static void for_each_cell(collection_mutation_view c, Func&& func) {
         auto m_view = deserialize_mutation_form(std::move(c));
         for (auto&& c : m_view.cells) {
             func(std::move(c.second));
@@ -1238,6 +1252,18 @@ shared_ptr<const abstract_type> data_type_for<simple_date_native_type>() {
 
 template <>
 inline
+shared_ptr<const abstract_type> data_type_for<timestamp_native_type>() {
+    return timestamp_type;
+}
+
+template <>
+inline
+shared_ptr<const abstract_type> data_type_for<timeuuid_native_type>() {
+    return timeuuid_type;
+}
+
+template <>
+inline
 shared_ptr<const abstract_type> data_type_for<net::ipv4_address>() {
     return inet_addr_type;
 }
@@ -1404,7 +1430,7 @@ bytes serialize_value(Type& t, const Value& value) {
 template<typename T>
 T read_simple(bytes_view& v) {
     if (v.size() < sizeof(T)) {
-        throw marshal_exception();
+        throw_with_backtrace<marshal_exception>(sprint("read_simple - not enough bytes (expected %d, got %d)", sizeof(T), v.size()));
     }
     auto p = v.begin();
     v.remove_prefix(sizeof(T));
@@ -1414,7 +1440,7 @@ T read_simple(bytes_view& v) {
 template<typename T>
 T read_simple_exactly(bytes_view v) {
     if (v.size() != sizeof(T)) {
-        throw marshal_exception();
+        throw_with_backtrace<marshal_exception>(sprint("read_simple_exactly - size mismatch (expected %d, got %d)", sizeof(T), v.size()));
     }
     auto p = v.begin();
     return net::ntoh(*reinterpret_cast<const net::packed<T>*>(p));
@@ -1424,7 +1450,7 @@ inline
 bytes_view
 read_simple_bytes(bytes_view& v, size_t n) {
     if (v.size() < n) {
-        throw marshal_exception();
+        throw_with_backtrace<marshal_exception>(sprint("read_simple_bytes - not enough bytes (requested %d, got %d)", n, v.size()));
     }
     bytes_view ret(v.begin(), n);
     v.remove_prefix(n);
@@ -1437,7 +1463,7 @@ std::experimental::optional<T> read_simple_opt(bytes_view& v) {
         return {};
     }
     if (v.size() != sizeof(T)) {
-        throw marshal_exception();
+        throw_with_backtrace<marshal_exception>(sprint("read_simple_opt - size mismatch (expected %d, got %d)", sizeof(T), v.size()));
     }
     auto p = v.begin();
     v.remove_prefix(sizeof(T));
@@ -1447,7 +1473,7 @@ std::experimental::optional<T> read_simple_opt(bytes_view& v) {
 inline sstring read_simple_short_string(bytes_view& v) {
     uint16_t len = read_simple<uint16_t>(v);
     if (v.size() < len) {
-        throw marshal_exception();
+        throw_with_backtrace<marshal_exception>(sprint("read_simple_short_string - not enough bytes (%d)", v.size()));
     }
     sstring ret(sstring::initialized_later(), len);
     std::copy(v.begin(), v.begin() + len, ret.begin());

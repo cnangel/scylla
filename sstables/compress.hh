@@ -51,37 +51,13 @@
 #include <iterator>
 #include <zlib.h>
 
-#include "core/file.hh"
-#include "core/reactor.hh"
-#include "core/shared_ptr.hh"
+#include <seastar/core/file.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/fstream.hh>
+
 #include "types.hh"
 #include "../compress.hh"
-
-// An "uncompress_func" is a function which uncompresses the given compressed
-// input chunk, and writes the uncompressed data into the given output buffer.
-// An exception is thrown if the output buffer is not big enough, but that
-// is not expected to happen - in the chunked compression scheme used here,
-// we know that the uncompressed data will be exactly chunk_size bytes (or
-// smaller for the last chunk).
-typedef size_t uncompress_func(const char* input, size_t input_len,
-        char* output, size_t output_len);
-
-uncompress_func uncompress_lz4;
-uncompress_func uncompress_snappy;
-uncompress_func uncompress_deflate;
-
-typedef size_t compress_func(const char* input, size_t input_len,
-        char* output, size_t output_len);
-
-compress_func compress_lz4;
-compress_func compress_snappy;
-compress_func compress_deflate;
-
-typedef size_t compress_max_size_func(size_t input_len);
-
-compress_max_size_func compress_max_size_lz4;
-compress_max_size_func compress_max_size_snappy;
-compress_max_size_func compress_max_size_deflate;
 
 inline uint32_t init_checksum_adler32() {
     return adler32(0, Z_NULL, 0);
@@ -103,7 +79,13 @@ inline uint32_t checksum_adler32_combine(uint32_t adler1, uint32_t adler2, size_
     return adler32_combine(adler1, adler2, input_len2);
 }
 
+class compression_parameters;
+class compressor;
+using compressor_ptr = shared_ptr<compressor>;
+
 namespace sstables {
+
+struct compression;
 
 struct compression {
     // To reduce the memory footpring of compression-info, n offsets are grouped
@@ -125,6 +107,50 @@ struct compression {
     // * The iterator and at() can't provide references to the elements.
     // * No point insert is available.
     class segmented_offsets {
+    public:
+        class state {
+            std::size_t _current_index{0};
+            std::size_t _current_bucket_index{0};
+            uint64_t _current_bucket_segment_index{0};
+            uint64_t _current_segment_relative_index{0};
+            uint64_t _current_segment_offset_bits{0};
+
+            void update_position_trackers(std::size_t index, uint16_t segment_size_bits,
+                uint32_t segments_per_bucket, uint8_t grouped_offsets);
+
+            friend class segmented_offsets;
+        };
+
+        class accessor {
+            const segmented_offsets& _offsets;
+            mutable state _state;
+        public:
+            accessor(const segmented_offsets& offsets) : _offsets(offsets) { }
+
+            uint64_t at(std::size_t i) const {
+                return _offsets.at(i, _state);
+            }
+        };
+
+        class writer {
+            segmented_offsets& _offsets;
+            state _state;
+        public:
+            writer(segmented_offsets& offsets) : _offsets(offsets) { }
+
+            void push_back(uint64_t offset) {
+                return _offsets.push_back(offset, _state);
+            }
+        };
+
+        accessor get_accessor() const {
+            return accessor(*this);
+        }
+
+        writer get_writer() {
+            return writer(*this);
+        }
+    private:
         struct bucket {
             uint64_t base_offset;
             std::unique_ptr<char[]> storage;
@@ -137,12 +163,6 @@ struct compression {
         uint32_t _segments_per_bucket{0};
         uint8_t _grouped_offsets{0};
 
-        mutable std::size_t _current_index{0};
-        mutable std::size_t _current_bucket_index{0};
-        mutable uint64_t _current_bucket_segment_index{0};
-        mutable uint64_t _current_segment_relative_index{0};
-        mutable uint64_t _current_segment_offset_bits{0};
-
         uint64_t _last_written_offset{0};
 
         std::size_t _size{0};
@@ -151,24 +171,24 @@ struct compression {
         uint64_t read(uint64_t bucket_index, uint64_t offset_bits, uint64_t size_bits) const;
         void write(uint64_t bucket_index, uint64_t offset_bits, uint64_t size_bits, uint64_t value);
 
-        void update_position_trackers(std::size_t index) const;
-
+        uint64_t at(std::size_t i, state& s) const;
+        void push_back(uint64_t offset, state& s);
     public:
         class const_iterator : public std::iterator<std::random_access_iterator_tag, const uint64_t> {
             friend class segmented_offsets;
             struct end_tag {};
 
-            const segmented_offsets& _offsets;
+            segmented_offsets::accessor _offsets;
             std::size_t _index;
 
             const_iterator(const segmented_offsets& offsets)
-                : _offsets(offsets)
+                : _offsets(offsets.get_accessor())
                 , _index(0) {
             }
 
             const_iterator(const segmented_offsets& offsets, end_tag)
-                : _offsets(offsets)
-                , _index(_offsets.size()) {
+                : _offsets(offsets.get_accessor())
+                , _index(offsets.size()) {
             }
 
         public:
@@ -279,10 +299,6 @@ struct compression {
             return _size;
         }
 
-        uint64_t at(std::size_t i) const;
-
-        void push_back(uint64_t offset);
-
         const_iterator begin() const {
             return const_iterator(*this);
         }
@@ -302,27 +318,22 @@ struct compression {
 
     disk_string<uint16_t> name;
     disk_array<uint32_t, option> options;
-    uint32_t chunk_len;
-    uint64_t data_len;
+    uint32_t chunk_len = 0;
+    uint64_t data_len = 0;
     segmented_offsets offsets;
 
 private:
-    // Variables determined from the above deserialized values, held for convenience:
-    uncompress_func *_uncompress = nullptr;
-    compress_func *_compress = nullptr;
-    // Return maximum length of data that compressor may output.
-    compress_max_size_func *_compress_max_size = nullptr;
     // Variables *not* found in the "Compression Info" file (added by update()):
     uint64_t _compressed_file_length = 0;
     uint32_t _full_checksum;
 public:
     // Set the compressor algorithm, please check the definition of enum compressor.
-    void set_compressor(compressor c);
+    void set_compressor(compressor_ptr c);
     // After changing _compression, update() must be called to update
-    // additional variables depending on it.
+    // additional variables depending on it.    
     void update(uint64_t compressed_file_length);
     operator bool() const {
-        return _uncompress != nullptr;
+        return !name.value.empty();
     }
     // locate() locates in the compressed file the given byte position of
     // the uncompressed data:
@@ -337,7 +348,7 @@ public:
         uint64_t chunk_len; // variable size of compressed chunk
         unsigned offset; // offset into chunk after uncompressing it
     };
-    chunk_and_offset locate(uint64_t position) const;
+    chunk_and_offset locate(uint64_t position, const compression::segmented_offsets::accessor& accessor);
 
     unsigned uncompressed_chunk_length() const noexcept {
         return chunk_len;
@@ -374,35 +385,22 @@ public:
         _full_checksum = checksum_adler32_combine(_full_checksum, checksum, size);
     }
 
-    size_t uncompress(
-            const char* input, size_t input_len,
-            char* output, size_t output_len) const {
-        if (!_uncompress) {
-            throw std::runtime_error("uncompress is not supported");
-        }
-        return _uncompress(input, input_len, output, output_len);
-    }
-    size_t compress(
-            const char* input, size_t input_len,
-            char* output, size_t output_len) const {
-        if (!_compress) {
-            throw std::runtime_error("compress is not supported");
-        }
-        return _compress(input, input_len, output, output_len);
-    }
-    size_t compress_max_size(size_t input_len) const {
-        return _compress_max_size(input_len);
-    }
+
     friend class sstable;
 };
-
-}
-
 
 // Note: compression_metadata is passed by reference; The caller is
 // responsible for keeping the compression_metadata alive as long as there
 // are open streams on it. This should happen naturally on a higher level -
 // as long as we have *sstables* work in progress, we need to keep the whole
 // sstable alive, and the compression metadata is only a part of it.
-input_stream<char> make_compressed_file_input_stream(
-        file f, sstables::compression *cm, uint64_t offset, size_t len, class file_input_stream_options options);
+input_stream<char> make_compressed_file_input_stream(file f,
+                sstables::compression *cm, uint64_t offset, size_t len,
+                class file_input_stream_options options);
+
+output_stream<char> make_compressed_file_output_stream(file f,
+                file_output_stream_options options, sstables::compression* cm,
+                const compression_parameters&);
+
+}
+

@@ -32,24 +32,29 @@
 #include "service/migration_manager.hh"
 #include "message/messaging_service.hh"
 #include "service/storage_service.hh"
+#include "auth/service.hh"
 #include "db/config.hh"
 #include "db/batchlog_manager.hh"
 #include "schema_builder.hh"
 #include "tmpdir.hh"
 #include "db/query_context.hh"
+#include "test_services.hh"
 
 // TODO: remove (#293)
 #include "message/messaging_service.hh"
 #include "gms/failure_detector.hh"
 #include "gms/gossiper.hh"
 #include "service/storage_service.hh"
-#include "auth/auth.hh"
+#include "auth/service.hh"
+#include "db/system_keyspace.hh"
 
 namespace sstables {
 
 future<> await_background_jobs_on_all_shards();
 
 }
+
+static const sstring testing_superuser = "tester";
 
 static future<> tst_init_ms_fd_gossiper(db::seed_provider_type seed_provider, sstring cluster_name = "Test Cluster") {
     return gms::get_failure_detector().start().then([seed_provider, cluster_name] {
@@ -82,15 +87,16 @@ public:
     static std::atomic<bool> active;
 private:
     ::shared_ptr<distributed<database>> _db;
+    ::shared_ptr<sharded<auth::service>> _auth_service;
     lw_shared_ptr<tmpdir> _data_dir;
 private:
     struct core_local_state {
         service::client_state client_state;
 
-        core_local_state()
-            : client_state(service::client_state::for_external_calls())
+        core_local_state(auth::service& auth_service)
+            : client_state(service::client_state::for_external_calls(auth_service))
         {
-            client_state.set_login(::make_shared<auth::authenticated_user>("cassandra"));
+            client_state.set_login(::make_shared<auth::authenticated_user>(testing_superuser));
         }
 
         future<> stop() {
@@ -106,7 +112,7 @@ private:
         return ::make_shared<service::query_state>(_core_local.local().client_state);
     }
 public:
-    single_node_cql_env(::shared_ptr<distributed<database>> db) : _db(db)
+    single_node_cql_env(::shared_ptr<distributed<database>> db, ::shared_ptr<sharded<auth::service>> auth_service) : _db(db), _auth_service(std::move(auth_service))
     { }
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(const sstring& text) override {
@@ -225,6 +231,10 @@ public:
         });
     }
 
+    virtual service::client_state& local_client_state() override {
+        return _core_local.local().client_state;
+    }
+
     virtual database& local_db() override {
         return _db->local();
     }
@@ -241,8 +251,12 @@ public:
         return cql3::get_query_processor();
     }
 
+    auth::service& local_auth_service() override {
+        return _auth_service->local();
+    }
+
     future<> start() {
-        return _core_local.start();
+        return _core_local.start(std::ref(*_auth_service));
     }
 
     future<> stop() {
@@ -289,17 +303,19 @@ public:
 
             const gms::inet_address listen("127.0.0.1");
             auto& ms = netw::get_messaging_service();
-            ms.start(listen, std::move(7000)).get();
+            // don't start listening so tests can be run in parallel
+            ms.start(listen, std::move(7000), false).get();
             auto stop_ms = defer([&ms] { ms.stop().get(); });
 
+            auto auth_service = ::make_shared<sharded<auth::service>>();
+
             auto& ss = service::get_storage_service();
-            ss.start(std::ref(*db)).get();
+            ss.start(std::ref(*db), std::ref(*auth_service)).get();
             auto stop_storage_service = defer([&ss] { ss.stop().get(); });
 
-            db->start(std::move(*cfg)).get();
+            db->start(std::move(*cfg), database_config()).get();
             auto stop_db = defer([db] {
                 db->stop().get();
-                sstables::cancel_prior_atomic_deletions();
             });
 
             // FIXME: split
@@ -317,7 +333,7 @@ public:
             distributed<service::migration_manager>& mm = service::get_migration_manager();
             distributed<db::batchlog_manager>& bm = db::get_batchlog_manager();
 
-            proxy.start(std::ref(*db)).get();
+            proxy.start(std::ref(*db), stdx::nullopt).get();
             auto stop_proxy = defer([&proxy] { proxy.stop().get(); });
 
             mm.start().get();
@@ -346,13 +362,29 @@ public:
             db::system_keyspace::init_local_cache().get();
             auto stop_local_cache = defer([] { db::system_keyspace::deinit_local_cache().get(); });
 
-            service::get_local_storage_service().init_server().get();
-            auto deinit_storage_service_server = defer([] {
+            service::get_local_storage_service().init_messaging_service_part().get();
+            service::get_local_storage_service().init_server_without_the_messaging_service_part(service::bind_messaging_port(false)).get();
+            auto deinit_storage_service_server = defer([auth_service] {
                 gms::stop_gossiping().get();
-                auth::auth::shutdown().get();
+                auth_service->stop().get();
             });
 
-            single_node_cql_env env(db);
+            // Create the testing user.
+            try {
+                auth::role_config config;
+                config.is_superuser = true;
+                config.can_login = true;
+
+                auth::create_role(
+                        auth_service->local(),
+                        testing_superuser,
+                        config,
+                        auth::authentication_options()).get0();
+            } catch (const auth::role_already_exists&) {
+                // The default user may already exist if this `cql_test_env` is starting with previously populated data.
+            }
+
+            single_node_cql_env env(db, auth_service);
             env.start().get();
             auto stop_env = defer([&env] { env.stop().get(); });
 
@@ -387,3 +419,28 @@ future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, const d
 future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func) {
     return do_with_cql_env_thread(std::move(func), db::config{});
 }
+
+class storage_service_for_tests::impl {
+    distributed<database> _db;
+    sharded<auth::service> _auth_service;
+public:
+    impl() {
+        auto thread = seastar::thread_impl::get();
+        assert(thread);
+        netw::get_messaging_service().start(gms::inet_address("127.0.0.1"), 7000, false).get();
+        service::get_storage_service().start(std::ref(_db), std::ref(_auth_service)).get();
+        service::get_storage_service().invoke_on_all([] (auto& ss) {
+            ss.enable_all_features();
+        }).get();
+    }
+    ~impl() {
+        service::get_storage_service().stop().get();
+        netw::get_messaging_service().stop().get();
+        _db.stop().get();
+    }
+};
+
+storage_service_for_tests::storage_service_for_tests() : _impl(std::make_unique<impl>()) {
+}
+
+storage_service_for_tests::~storage_service_for_tests() = default;

@@ -30,6 +30,7 @@
 #include "schema_builder.hh"
 #include "core/thread.hh"
 #include "sstables/index_reader.hh"
+#include "tests/test_services.hh"
 
 static auto la = sstables::sstable::version_types::la;
 static auto big = sstables::sstable::format_types::big;
@@ -76,9 +77,11 @@ public:
 
     future<index_list> read_indexes() {
         auto l = make_lw_shared<index_list>();
-        return do_with(_sst->get_index_reader(default_priority_class()), [l] (auto& ir) {
+        // FIXME: kill shared_index_lists
+        return do_with(std::make_unique<shared_index_lists>(), [this, l] (std::unique_ptr<shared_index_lists>& sil) {
+          return do_with(std::make_unique<index_reader>(_sst, default_priority_class(), *sil), [this, l] (std::unique_ptr<index_reader>& ir) {
             return ir->read_partition_data().then([&, l] {
-                l->push_back(ir->current_partition_entry());
+                l->push_back(std::move(ir->current_partition_entry()));
             }).then([&, l] {
                 return repeat([&, l] {
                     return ir->advance_to_next_partition().then([&, l] {
@@ -86,13 +89,14 @@ public:
                             return stop_iteration::yes;
                         }
 
-                        l->push_back(ir->current_partition_entry());
+                        l->push_back(std::move(ir->current_partition_entry()));
                         return stop_iteration::no;
                     });
                 });
             });
+          });
         }).then([l] {
-            return *l;
+            return std::move(*l);
         });
     }
 
@@ -114,6 +118,10 @@ public:
 
     summary& get_summary() {
         return _sst->_components->summary;
+    }
+
+    summary move_summary() {
+        return std::move(_sst->_components->summary);
     }
 
     future<> read_toc() {
@@ -178,13 +186,48 @@ public:
     }
 
     void set_values(sstring first_key, sstring last_key, stats_metadata stats) {
+        // scylla component must be present for a sstable to be considered fully expired.
+        _sst->_recognized_components.insert(sstable::component_type::Scylla);
         _sst->_components->statistics.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
         _sst->_components->summary.first_key.value = bytes(reinterpret_cast<const signed char*>(first_key.c_str()), first_key.size());
         _sst->_components->summary.last_key.value = bytes(reinterpret_cast<const signed char*>(last_key.c_str()), last_key.size());
         _sst->set_first_and_last_keys();
         _sst->_components->statistics.contents[metadata_type::Compaction] = std::make_unique<compaction_metadata>();
     }
+
+    void rewrite_toc_without_scylla_component() {
+        _sst->_recognized_components.erase(sstable::component_type::Scylla);
+        remove_file(_sst->filename(sstable::component_type::TOC)).get();
+        _sst->write_toc(default_priority_class());
+        _sst->seal_sstable().get();
+    }
+
+    future<> remove_component(sstable::component_type c) {
+        return remove_file(_sst->filename(c));
+    }
 };
+
+inline sstring get_test_dir(const sstring& name, const sstring& ks, const sstring& cf)
+{
+    return seastar::sprint("tests/sstables/%s/%s/%s-1c6ace40fad111e7b9cf000000000002", name, ks, cf);
+}
+
+inline sstring get_test_dir(const sstring& name, const schema_ptr s)
+{
+    return seastar::sprint("tests/sstables/%s/%s/%s-1c6ace40fad111e7b9cf000000000002", name, s->ks_name(), s->cf_name());
+}
+
+inline sstables::sstable::version_types all_sstable_versions[] = {
+    sstables::sstable::version_types::ka,
+    sstables::sstable::version_types::la,
+};
+
+template<typename AsyncAction>
+GCC6_CONCEPT( requires requires (AsyncAction aa, sstables::sstable::version_types& c) { { aa(c) } -> future<> } )
+inline
+future<> for_each_sstable_version(AsyncAction action) {
+    return seastar::do_for_each(all_sstable_versions, std::move(action));
+}
 
 inline future<sstable_ptr> reusable_sst(schema_ptr schema, sstring dir, unsigned long generation) {
     auto sst = sstables::make_sstable(std::move(schema), dir, generation, la, big);
@@ -307,13 +350,21 @@ inline schema_ptr uncompressed_schema(int32_t min_index_interval = 0) {
         // comment
         "Uncompressed data"
        )));
-       builder.set_compressor_params(compression_parameters({ }));
+       builder.set_compressor_params(compression_parameters());
        if (min_index_interval) {
            builder.set_min_index_interval(min_index_interval);
        }
        return builder.build(schema_builder::compact_storage::no);
     }();
     return uncompressed;
+}
+
+inline sstring uncompressed_dir() {
+    return get_test_dir("uncompressed", uncompressed_schema());
+}
+
+inline sstring generation_dir() {
+    return get_test_dir("generation", uncompressed_schema());
 }
 
 inline schema_ptr complex_schema() {
@@ -621,12 +672,13 @@ public:
     }
 
     static future<> do_with_test_directory(std::function<future<> ()>&& fut, sstring p = path()) {
-        return test_setup::create_empty_test_dir(p).then([fut = std::move(fut), p] () mutable {
-            return fut();
-        }).finally([p] {
-            return test_setup::empty_test_dir(p).then([p] {
-                return engine().remove_file(p);
-            });
+        return seastar::async([p, fut = std::move(fut)] {
+            storage_service_for_tests ssft;
+            boost::filesystem::create_directories(std::string(p));
+            fut().get();
+            test_setup::empty_test_dir(p).get();
+            // FIXME: this removes only the last component in the path that often contains: `test-name/ks/cf-uuid'
+            engine().remove_file(p).get();
         });
     }
 };
@@ -635,4 +687,11 @@ public:
 inline
 ::mutation_source as_mutation_source(sstables::shared_sstable sst) {
     return sst->as_mutation_source();
+}
+
+
+inline dht::decorated_key make_dkey(schema_ptr s, bytes b)
+{
+    auto sst_key = sstables::key::from_bytes(b);
+    return dht::global_partitioner().decorate_key(*s, sst_key.to_partition_key(*s));
 }

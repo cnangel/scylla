@@ -21,6 +21,8 @@
 
 #include "mutation.hh"
 #include "query-result-writer.hh"
+#include "flat_mutation_reader.hh"
+#include "mutation_rebuilder.hh"
 
 mutation::data::data(dht::decorated_key&& key, schema_ptr&& schema)
     : _schema(std::move(schema))
@@ -119,20 +121,20 @@ mutation::query(query::result::builder& builder,
 
 query::result
 mutation::query(const query::partition_slice& slice,
-    query::result_request request,
+    query::result_options opts,
     gc_clock::time_point now, uint32_t row_limit) &&
 {
-    query::result::builder builder(slice, request, { });
+    query::result::builder builder(slice, opts, { });
     std::move(*this).query(builder, slice, now, row_limit);
     return builder.build();
 }
 
 query::result
 mutation::query(const query::partition_slice& slice,
-    query::result_request request,
+    query::result_options opts,
     gc_clock::time_point now, uint32_t row_limit) const&
 {
-    return mutation(*this).query(slice, request, now, row_limit);
+    return mutation(*this).query(slice, opts, now, row_limit);
 }
 
 size_t
@@ -186,6 +188,10 @@ void mutation::apply(const mutation& m) {
     partition().apply(*schema(), m.partition(), *m.schema());
 }
 
+void mutation::apply(const mutation_fragment& mf) {
+    partition().apply(*schema(), mf);
+}
+
 mutation& mutation::operator=(const mutation& m) {
     return *this = mutation(m);
 }
@@ -207,60 +213,66 @@ mutation& mutation::operator+=(mutation&& other) {
 }
 
 mutation mutation::sliced(const query::clustering_row_ranges& ranges) const {
-    auto m = mutation(schema(), decorated_key(), mutation_partition(partition(), *schema(), ranges));
-    m.partition().row_tombstones().trim(*schema(), ranges);
-    return m;
+    return mutation(schema(), decorated_key(), partition().sliced(*schema(), ranges));
 }
 
-class mutation_rebuilder {
-    mutation _m;
-    streamed_mutation& _sm;
-    size_t _remaining_limit;
-
-public:
-    mutation_rebuilder(streamed_mutation& sm)
-        : _m(sm.decorated_key(), sm.schema()), _sm(sm), _remaining_limit(0) {
+future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reader& r) {
+    if (r.is_buffer_empty()) {
+        if (r.is_end_of_stream()) {
+            return make_ready_future<mutation_opt>();
+        }
+        return r.fill_buffer().then([&r] {
+            return read_mutation_from_flat_mutation_reader(r);
+        });
     }
+    // r.is_buffer_empty() is always false at this point
+    struct adapter {
+        schema_ptr _s;
+        stdx::optional<mutation_rebuilder> _builder;
+        adapter(schema_ptr s) : _s(std::move(s)) { }
 
-    stop_iteration consume(tombstone t) {
-        _m.partition().apply(t);
-        return stop_iteration::no;
-    }
+        void consume_new_partition(const dht::decorated_key& dk) {
+            _builder = mutation_rebuilder(dk, std::move(_s));
+        }
 
-    stop_iteration consume(range_tombstone&& rt) {
-        _m.partition().apply_row_tombstone(*_m.schema(), std::move(rt));
-        return stop_iteration::no;
-    }
+        stop_iteration consume(tombstone t) {
+            assert(_builder);
+            return _builder->consume(t);
+        }
 
-    stop_iteration consume(static_row&& sr) {
-        _m.partition().static_row().apply(*_m.schema(), column_kind::static_column, std::move(sr.cells()));
-        return stop_iteration::no;
-    }
+        stop_iteration consume(range_tombstone&& rt) {
+            assert(_builder);
+            return _builder->consume(std::move(rt));
+        }
 
-    stop_iteration consume(clustering_row&& cr) {
-        auto& dr = _m.partition().clustered_row(*_m.schema(), std::move(cr.key()));
-        dr.apply(cr.tomb());
-        dr.apply(cr.marker());
-        dr.cells().apply(*_m.schema(), column_kind::regular_column, std::move(cr.cells()));
-        return stop_iteration::no;
-    }
+        stop_iteration consume(static_row&& sr) {
+            assert(_builder);
+            return _builder->consume(std::move(sr));
+        }
 
-    mutation_opt consume_end_of_stream() {
-        return mutation_opt(std::move(_m));
-    }
-};
+        stop_iteration consume(clustering_row&& cr) {
+            assert(_builder);
+            return _builder->consume(std::move(cr));
+        }
 
-future<mutation_opt> mutation_from_streamed_mutation(streamed_mutation_opt sm) {
-    if (!sm) {
-        return make_ready_future<mutation_opt>();
-    }
-    return do_with(std::move(*sm), [] (auto& sm) {
-        return consume(sm, mutation_rebuilder(sm));
-    });
+        stop_iteration consume_end_of_partition() {
+            assert(_builder);
+            return stop_iteration::yes;
+        }
+
+        mutation_opt consume_end_of_stream() {
+            if (!_builder) {
+                return mutation_opt();
+            }
+            return _builder->consume_end_of_stream();
+        }
+    };
+    return r.consume(adapter(r.schema()));
 }
 
-future<mutation> mutation_from_streamed_mutation(streamed_mutation& sm) {
-    return consume(sm, mutation_rebuilder(sm)).then([] (mutation_opt&& mo) {
-        return std::move(*mo);
-    });
+std::ostream& operator<<(std::ostream& os, const mutation& m) {
+    const ::schema& s = *m.schema();
+    fprint(os, "{%s.%s %s ", s.ks_name(), s.cf_name(), m.decorated_key());
+    os << m.partition() << "}";
+    return os;
 }

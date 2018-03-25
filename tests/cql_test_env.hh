@@ -38,6 +38,10 @@
 
 class database;
 
+namespace auth {
+class service;
+}
+
 namespace cql3 {
     class query_processor;
 }
@@ -80,6 +84,8 @@ public:
 
     virtual future<> stop() = 0;
 
+    virtual service::client_state& local_client_state() = 0;
+
     virtual database& local_db() = 0;
 
     virtual cql3::query_processor& local_qp() = 0;
@@ -87,6 +93,8 @@ public:
     virtual distributed<database>& db() = 0;
 
     virtual distributed<cql3::query_processor> & qp() = 0;
+
+    virtual auth::service& local_auth_service() = 0;
 };
 
 future<> do_with_cql_env(std::function<future<>(cql_test_env&)> func);

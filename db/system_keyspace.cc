@@ -72,7 +72,9 @@
 #include "message/messaging_service.hh"
 #include "mutation_query.hh"
 #include "db/size_estimates_virtual_reader.hh"
+#include "db/timeout_clock.hh"
 #include "sstables/sstables.hh"
+#include "db/schema_tables.hh"
 
 using days = std::chrono::duration<int, std::ratio<24 * 3600>>;
 
@@ -1577,10 +1579,7 @@ void make(database& db, bool durable, bool volatile_testing_only) {
             kscfg.enable_commitlog = !volatile_testing_only;
             kscfg.enable_cache = true;
             // don't make system keyspace reads wait for user reads
-            kscfg.read_concurrency_config.resources_sem = &db.system_keyspace_read_concurrency_sem();
-            kscfg.read_concurrency_config.active_reads = &db.get_stats().active_reads_system_keyspace;
-            kscfg.read_concurrency_config.timeout = {};
-            kscfg.read_concurrency_config.max_queue_length = std::numeric_limits<size_t>::max();
+            kscfg.read_concurrency_semaphore = &db.system_keyspace_read_concurrency_sem();
             // don't make system keyspace writes wait for user writes (if under pressure)
             kscfg.dirty_memory_manager = &db._system_dirty_memory_manager;
             keyspace _ks{ksm, std::move(kscfg)};
@@ -1653,7 +1652,7 @@ query_mutations(distributed<service::storage_proxy>& proxy, const sstring& ks_na
     auto slice = partition_slice_builder(*schema).build();
     auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(),
         std::move(slice), std::numeric_limits<uint32_t>::max());
-    return proxy.local().query_mutations_locally(std::move(schema), std::move(cmd), query::full_partition_range)
+    return proxy.local().query_mutations_locally(std::move(schema), std::move(cmd), query::full_partition_range, db::no_timeout)
             .then([] (foreign_ptr<lw_shared_ptr<reconcilable_result>> rr, auto ht) { return std::move(rr); });
 }
 
@@ -1664,8 +1663,9 @@ query(distributed<service::storage_proxy>& proxy, const sstring& ks_name, const 
     auto slice = partition_slice_builder(*schema).build();
     auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(),
         std::move(slice), std::numeric_limits<uint32_t>::max());
-    return proxy.local().query(schema, cmd, {query::full_partition_range}, db::consistency_level::ONE, nullptr).then([schema, cmd] (auto&& result) {
-        return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *result));
+    return proxy.local().query(schema, cmd, {query::full_partition_range}, db::consistency_level::ONE,
+            {nullptr, db::no_timeout}).then([schema, cmd] (auto&& qr) {
+        return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
     });
 }
 
@@ -1678,8 +1678,10 @@ query(distributed<service::storage_proxy>& proxy, const sstring& ks_name, const 
         .with_range(std::move(row_range))
         .build();
     auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), query::max_rows);
-    return proxy.local().query(schema, cmd, {dht::partition_range::make_singular(key)}, db::consistency_level::ONE, nullptr).then([schema, cmd] (auto&& result) {
-        return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *result));
+
+    return proxy.local().query(schema, cmd, {dht::partition_range::make_singular(key)}, db::consistency_level::ONE,
+            {nullptr, db::no_timeout}).then([schema, cmd] (auto&& qr) {
+        return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
     });
 }
 
@@ -1768,7 +1770,7 @@ future<int> increment_and_get_generation() {
 mutation make_size_estimates_mutation(const sstring& ks, std::vector<range_estimates> estimates) {
     auto&& schema = db::system_keyspace::size_estimates();
     auto timestamp = api::new_timestamp();
-    mutation m_to_apply{partition_key::from_single_value(*schema, utf8_type->decompose(ks)), schema};
+    mutation m_to_apply{schema, partition_key::from_single_value(*schema, utf8_type->decompose(ks))};
 
     for (auto&& e : estimates) {
         auto ck = clustering_key_prefix(std::vector<bytes>{
@@ -1782,4 +1784,9 @@ mutation make_size_estimates_mutation(const sstring& ks, std::vector<range_estim
 }
 
 } // namespace system_keyspace
+
+sstring system_keyspace_name() {
+    return system_keyspace::NAME;
+}
+
 } // namespace db

@@ -31,12 +31,7 @@
 #include "utils/div_ceil.hh"
 #include <seastar/core/reactor.hh>
 
-#include "disk-error-handler.hh"
-
 logging::logger test_log("test");
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
 
 static thread_local bool cancelled = false;
 
@@ -80,8 +75,6 @@ int main(int argc, char** argv) {
             auto reads_enabled = !app.configuration().count("no-reads");
             auto seconds = app.configuration()["seconds"].as<unsigned>();
 
-            simple_schema ss;
-
             engine().at_exit([] {
                 cancelled = true;
                 return make_ready_future();
@@ -94,9 +87,9 @@ int main(int argc, char** argv) {
             });
             completion_timer.arm(std::chrono::seconds(seconds));
 
-            env.execute_cql(ss.cql()).get();
+            env.execute_cql("CREATE TABLE ks.cf (pk text, ck int, v text, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck DESC)").get();
             database& db = env.local_db();
-            auto s = db.find_schema(ss.schema()->ks_name(), ss.schema()->cf_name());
+            auto s = db.find_schema("ks", "cf");
             column_family& cf = db.find_column_family(s->id());
             cf.set_compaction_strategy(sstables::compaction_strategy_type::null);
 
@@ -108,8 +101,8 @@ int main(int argc, char** argv) {
             timer<> stats_printer;
             monotonic_counter<uint64_t> reads_ctr([&] { return reads; });
             monotonic_counter<uint64_t> mutations_ctr([&] { return mutations; });
-            monotonic_counter<uint64_t> eviction_ctr([&] { return global_cache_tracker().get_stats().partition_evictions; });
             monotonic_counter<uint64_t> pmerges_ctr([&] { return global_cache_tracker().get_stats().partition_merges; });
+            monotonic_counter<uint64_t> eviction_ctr([&] { return global_cache_tracker().get_stats().row_evictions; });
             monotonic_counter<uint64_t> miss_ctr([&] { return global_cache_tracker().get_stats().reads_with_misses; });
             stats_printer.set_callback([&] {
                 auto MB = 1024 * 1024;
@@ -144,7 +137,12 @@ int main(int argc, char** argv) {
             });
             stats_printer.arm_periodic(1s);
 
-            auto pkey = ss.make_pkey("key1");
+            auto make_pkey = [s] (sstring pk) {
+                auto key = partition_key::from_single_value(*s, data_value(pk).serialize());
+                return dht::global_partitioner().decorate_key(*s, key);
+            };
+
+            auto pkey = make_pkey("key1");
             sstring value = sstring(sstring::initialized_later(), 1024);
 
             using clock = std::chrono::steady_clock;
@@ -164,10 +162,12 @@ int main(int argc, char** argv) {
             });
 
             auto mutator = seastar::async([&] {
-                uint32_t ckey_seq = 0;
+                int32_t ckey_seq = 0;
                 while (!cancelled) {
-                    mutation m(pkey, s);
-                    ss.add_row(m, ss.make_ckey(ckey_seq++), value);
+                    mutation m(s, pkey);
+                    auto ck = clustering_key::from_single_value(*s, data_value(ckey_seq++).serialize());
+                    auto&& col = *s->get_column_definition(to_bytes("v"));
+                    m.set_clustered_cell(ck, col, atomic_cell::make_live(api::new_timestamp(), data_value(value).serialize()));
                     auto t0 = clock::now();
                     db.apply(s, freeze(m)).get();
                     writes_hist.add(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count());

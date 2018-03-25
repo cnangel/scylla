@@ -27,11 +27,7 @@
 #include "keys.hh"
 #include "schema_builder.hh"
 #include "range_tombstone_list.hh"
-
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
+#include "range_tombstone_list_assertions.hh"
 
 static schema_ptr s = schema_builder("ks", "cf")
         .with_column("pk", int32_type, column_kind::partition_key)
@@ -284,7 +280,7 @@ BOOST_AUTO_TEST_CASE(test_search_prefix) {
 
     range_tombstone_list l1(*s);
 
-    l1.apply(*s, range_tombstone(key({1}), bound_kind::excl_start, key({1, 2}), bound_kind::incl_end, {8, gc_now}));
+    l1.apply(*s, range_tombstone(key({1}), bound_kind::excl_start, key({2, 2}), bound_kind::incl_end, {8, gc_now}));
     l1.apply(*s, range_tombstone(key({1, 2}), bound_kind::excl_start, key({1, 3}), bound_kind::incl_end, {12, gc_now}));
 
     BOOST_REQUIRE(tombstone() == l1.search_tombstone_covering(*s, key({1})));
@@ -591,6 +587,24 @@ BOOST_AUTO_TEST_CASE(test_add_overlapping_range_to_range_with_empty_end) {
     BOOST_REQUIRE(it == l.end());
 }
 
+// Reproduces https://github.com/scylladb/scylla/issues/3083
+BOOST_AUTO_TEST_CASE(test_coalescing_with_end_bound_inclusiveness_change_with_prefix_bound) {
+    range_tombstone_list l(*s);
+
+    auto rt1 = rtie(4, 8, 4);
+    auto rt2 = range_tombstone(key({8, 1}), bound_kind::incl_start, key({10}), bound_kind::excl_end, {1, gc_now});
+
+    l.apply(*s, rt1);
+    l.apply(*s, rt2);
+
+    l.apply(*s, rt(1, 5, 4));
+
+    auto it = l.begin();
+    assert_rt(rtie(1, 8, 4), *it++);
+    assert_rt(rt2, *it++);
+    BOOST_REQUIRE(it == l.end());
+}
+
 BOOST_AUTO_TEST_CASE(test_search_with_empty_start) {
     range_tombstone_list l(*s);
 
@@ -689,4 +703,212 @@ BOOST_AUTO_TEST_CASE(test_difference_with_smaller_tombstone) {
     assert_rt(rtee(9, 10, 1), *it++);
     assert_rt(rtei(13, 14, 1), *it++);
     BOOST_REQUIRE(it == diff.end());
+}
+
+BOOST_AUTO_TEST_CASE(test_exception_safety) {
+    int pos = 1;
+    auto next_pos = [&] { return pos++; };
+
+    auto ts0 = 0;
+    auto ts1 = 1;
+
+    range_tombstone_list original(*s);
+    range_tombstone_list to_apply(*s);
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        original.apply(*s, rtie(p1, p2, ts0));
+    }
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        to_apply.apply(*s, rtie(p1, p2, ts0));
+    }
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        to_apply.apply(*s, rtie(p1, p2, ts0));
+    }
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        original.apply(*s, rtie(p1, p2, ts0));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        auto p5 = next_pos();
+        auto p6 = next_pos();
+        to_apply.apply(*s, rtie(p1, p3, ts1));
+        to_apply.apply(*s, rtie(p4, p6, ts1));
+        original.apply(*s, rtie(p2, p5, ts0));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        auto p5 = next_pos();
+        auto p6 = next_pos();
+        to_apply.apply(*s, rtie(p1, p3, ts0));
+        to_apply.apply(*s, rtie(p4, p6, ts0));
+        original.apply(*s, rtie(p2, p5, ts1));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        auto p5 = next_pos();
+        auto p6 = next_pos();
+        to_apply.apply(*s, rtie(p1, p3, ts0));
+        to_apply.apply(*s, rtie(p4, p6, ts1));
+        original.apply(*s, rtie(p2, p5, ts1));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        auto p5 = next_pos();
+        auto p6 = next_pos();
+        to_apply.apply(*s, rtie(p1, p3, ts1));
+        to_apply.apply(*s, rtie(p4, p6, ts0));
+        original.apply(*s, rtie(p2, p5, ts1));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        auto p5 = next_pos();
+        auto p6 = next_pos();
+        to_apply.apply(*s, rtie(p1, p3, ts1));
+        to_apply.apply(*s, rtie(p4, p6, ts1));
+        original.apply(*s, rtie(p2, p5, ts1));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        to_apply.apply(*s, rtie(p1, p4, ts1));
+        original.apply(*s, rtie(p2, p3, ts0));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        to_apply.apply(*s, rtie(p1, p4, ts0));
+        original.apply(*s, rtie(p2, p3, ts1));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        to_apply.apply(*s, rtie(p2, p3, ts0));
+        original.apply(*s, rtie(p1, p4, ts1));
+    }
+
+    {
+        auto p1 = next_pos();
+        auto p2 = next_pos();
+        auto p3 = next_pos();
+        auto p4 = next_pos();
+        to_apply.apply(*s, rtie(p2, p3, ts1));
+        original.apply(*s, rtie(p1, p4, ts0));
+    }
+
+    auto expected = original;
+    expected.apply(*s, to_apply);
+
+    // test apply_monotonically()
+    auto&& injector = memory::local_failure_injector();
+    uint64_t i = 0;
+    do {
+        auto list = original;
+        try {
+            injector.fail_after(i++);
+            list.apply_monotonically(*s, to_apply);
+            injector.cancel();
+            assert_that(*s, list).is_equal_to(expected);
+        } catch (const std::bad_alloc&) { // expected
+            assert_that(*s, list).has_no_less_information_than(original);
+        }
+    } while (injector.failed());
+
+    // test apply_reversibly()
+    i = 0;
+    do {
+        auto list = original;
+        try {
+            injector.fail_after(i++);
+            list.apply_reversibly(*s, to_apply).cancel();
+            injector.cancel();
+            assert_that(*s, list).is_equal_to(expected);
+        } catch (const std::bad_alloc&) { // expected
+            assert_that(*s, list).is_equal_to_either(original, expected);
+        }
+    } while (injector.failed());
+}
+
+BOOST_AUTO_TEST_CASE(test_accumulator) {
+    auto ts1 = 1;
+    auto ts2 = 2;
+
+    BOOST_TEST_MESSAGE("Forward");
+    auto acc = range_tombstone_accumulator(*s, false);
+    acc.apply(rtie(0, 4, ts1));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 0 })), tombstone(ts1, gc_now));
+    acc.apply(rtie(1, 2, ts2));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 1 })), tombstone(ts2, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 2 })), tombstone(ts1, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 3 })), tombstone(ts1, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 4 })), tombstone());
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 5 })), tombstone());
+    acc.apply(rtie(6, 8, ts2));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 9 })), tombstone());
+    acc.apply(rtie(10, 12, ts1));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 10 })), tombstone(ts1, gc_now));
+    acc.apply(rtie(11, 14, ts2));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 11 })), tombstone(ts2, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 12 })), tombstone(ts2, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 13 })), tombstone(ts2, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 14 })), tombstone());
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 15 })), tombstone());
+
+    BOOST_TEST_MESSAGE("Reversed");
+    acc = range_tombstone_accumulator(*s, true);
+
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 15 })), tombstone());
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 14 })), tombstone());
+    acc.apply(rtie(11, 14, ts2));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 13 })), tombstone(ts2, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 12 })), tombstone(ts2, gc_now));
+    acc.apply(rtie(10, 12, ts1));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 11 })), tombstone(ts2, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 10 })), tombstone(ts1, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 9 })), tombstone());
+    acc.apply(rtie(6, 8, ts2));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 5 })), tombstone());
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 4 })), tombstone());
+    acc.apply(rtie(0, 4, ts1));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 3 })), tombstone(ts1, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 2 })), tombstone(ts1, gc_now));
+    acc.apply(rtie(1, 2, ts2));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 1 })), tombstone(ts2, gc_now));
+    BOOST_REQUIRE_EQUAL(acc.tombstone_for_row(key({ 0 })), tombstone(ts1, gc_now));
 }

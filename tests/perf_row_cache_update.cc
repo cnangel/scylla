@@ -32,11 +32,6 @@
 #include "memtable.hh"
 #include "tests/perf/perf.hh"
 
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
-
 static
 dht::decorated_key new_key(schema_ptr s) {
     static thread_local int next = 0;
@@ -82,7 +77,7 @@ int main(int argc, char** argv) {
 
             std::vector<mutation> mutations;
             for (unsigned i = 0; i < partitions; ++i) {
-                mutation m(new_key(s), s);
+                mutation m(s, new_key(s));
                 for (size_t j = 0; j < row_count; j++) {
                     m.set_clustered_cell(new_ckey(s), "v", data_value(bytes(bytes::initialized_later(), cell_size)), 2);
                 }

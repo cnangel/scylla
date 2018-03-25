@@ -43,6 +43,7 @@
 #include "query_pager.hh"
 #include "cql3/selection/selection.hh"
 #include "log.hh"
+#include "service/storage_proxy.hh"
 #include "to_string.hh"
 
 static logging::logger qlogger("paging");
@@ -77,7 +78,18 @@ private:
             _max = state->get_remaining();
             _last_pkey = state->get_partition_key();
             _last_ckey = state->get_clustering_key();
+            _cmd->query_uuid = state->get_query_uuid();
+            _cmd->is_first_page = false;
+            _last_replicas = state->get_last_replicas();
+            _query_read_repair_decision = state->get_query_read_repair_decision();
+        } else {
+            // Reusing readers is currently only supported for singular queries.
+            if (_ranges.front().is_singular()) {
+                _cmd->query_uuid = utils::make_random_uuid();
+            }
+            _cmd->is_first_page = true;
         }
+        qlogger.trace("fetch_page query id {}", _cmd->query_uuid);
 
         if (_last_pkey) {
             auto dpk = dht::global_partitioner().decorate_key(*_schema, *_last_pkey);
@@ -203,10 +215,15 @@ private:
 
         auto ranges = _ranges;
         auto command = ::make_lw_shared<query::read_command>(*_cmd);
-        return get_local_storage_proxy().query(_schema, std::move(command), std::move(ranges),
-                _options.get_consistency(), _state.get_trace_state()).then(
-                [this, &builder, page_size, now](foreign_ptr<lw_shared_ptr<query::result>> results) {
-                    handle_result(builder, std::move(results), page_size, now);
+        return get_local_storage_proxy().query(_schema,
+                std::move(command),
+                std::move(ranges),
+                _options.get_consistency(),
+                {_state.get_trace_state(), {}, std::move(_last_replicas), _query_read_repair_decision}).then(
+                [this, &builder, page_size, now](service::storage_proxy::coordinator_query_result qr) {
+                    _last_replicas = std::move(qr.last_replicas);
+                    _query_read_repair_decision = qr.read_repair_decision;
+                    handle_result(builder, std::move(qr.query_result), page_size, now);
                 });
     }
 
@@ -300,10 +317,8 @@ private:
     }
 
     ::shared_ptr<const service::pager::paging_state> state() const override {
-        return _exhausted ?
-                        nullptr :
-                        ::make_shared<const paging_state>(*_last_pkey,
-                                        _last_ckey, _max);
+        return _exhausted ?  nullptr : ::make_shared<const paging_state>(*_last_pkey,
+                _last_ckey, _max, _cmd->query_uuid, _last_replicas, _query_read_repair_decision);
     }
 
 private:
@@ -321,6 +336,8 @@ private:
     const cql3::query_options& _options;
     lw_shared_ptr<query::read_command> _cmd;
     dht::partition_range_vector _ranges;
+    paging_state::replicas_per_token_range _last_replicas;
+    std::experimental::optional<db::read_repair_decision> _query_read_repair_decision;
 };
 
 bool service::pager::query_pagers::may_need_paging(uint32_t page_size,

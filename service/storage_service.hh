@@ -39,6 +39,7 @@
 
 #pragma once
 
+#include "auth/service.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "locator/token_metadata.hh"
@@ -50,7 +51,6 @@
 #include "dht/token_range_endpoints.hh"
 #include "core/sleep.hh"
 #include "gms/application_state.hh"
-#include "db/system_keyspace.hh"
 #include "core/semaphore.hh"
 #include "utils/fb_utilities.hh"
 #include "utils/serialized_action.hh"
@@ -83,6 +83,9 @@ int get_generation_number();
 
 enum class disk_error { regular, commit };
 
+struct bind_messaging_port_tag {};
+using bind_messaging_port = bool_class<bind_messaging_port_tag>;
+
 /**
  * This abstraction contains the token/identifier of this node
  * on the identifier space. This token gets gossiped around.
@@ -113,6 +116,7 @@ private:
     private final AtomicLong notificationSerialNumber = new AtomicLong();
 #endif
     distributed<database>& _db;
+    sharded<auth::service>& _auth_service;
     int _update_jobs{0};
     // Note that this is obviously only valid for the current shard. Users of
     // this facility should elect a shard to be the coordinator based on any
@@ -129,7 +133,7 @@ private:
     bool _ms_stopped = false;
     bool _stream_manager_stopped = false;
 public:
-    storage_service(distributed<database>& db);
+    storage_service(distributed<database>& db, sharded<auth::service>&);
     void isolate_on_error();
     void isolate_on_commit_error();
 
@@ -139,11 +143,16 @@ public:
     void uninit_messaging_service();
 
 private:
-    void do_update_pending_ranges();
+    future<> do_update_pending_ranges();
 
 public:
     future<> keyspace_changed(const sstring& ks_name);
     future<> update_pending_ranges();
+    void update_pending_ranges_nowait(inet_address endpoint);
+
+    auth::service& get_local_auth_service() {
+        return _auth_service.local();
+    }
 
     const locator::token_metadata& get_token_metadata() const {
         return _token_metadata;
@@ -267,6 +276,11 @@ private:
     gms::feature _digest_multipartition_read_feature;
     gms::feature _correct_counter_order_feature;
     gms::feature _schema_tables_v3;
+    gms::feature _correct_non_compound_range_tombstones;
+    gms::feature _write_failure_reply_feature;
+    gms::feature _xxhash_feature;
+    gms::feature _roles_feature;
+    gms::feature _la_sstable_feature;
 public:
     void enable_all_features() {
         _range_tombstones_feature.enable();
@@ -277,6 +291,11 @@ public:
         _digest_multipartition_read_feature.enable();
         _correct_counter_order_feature.enable();
         _schema_tables_v3.enable();
+        _correct_non_compound_range_tombstones.enable();
+        _write_failure_reply_feature.enable();
+        _xxhash_feature.enable();
+        _roles_feature.enable();
+        _la_sstable_feature.enable();
     }
 
     void finish_bootstrapping() {
@@ -302,7 +321,7 @@ public:
     future<> stop_gossiping();
 
     // should only be called via JMX
-    future<> start_gossiping();
+    future<> start_gossiping(bind_messaging_port do_bind = bind_messaging_port::yes);
 
     // should only be called via JMX
     future<bool> is_gossip_running();
@@ -387,11 +406,35 @@ public:
     }
 #endif
 public:
-    future<> init_server() {
-        return init_server(get_ring_delay().count());
+    /*!
+     * \brief Init the messaging service part of the service.
+     *
+     * This is the first part of the initialization, call this method
+     * first.
+     *
+     * After this method is completed, it is ok to start the storage_service
+     * API.
+     * \see init_server_without_the_messaging_service_part
+     */
+    future<> init_messaging_service_part();
+
+    /*!
+     * \brief complete the server initialization
+     *
+     * The storage_service initialization is done in two parts.
+     *
+     * you first call init_messaging_service_part and then
+     * you call init_server_without_the_messaging_service_part.
+     *
+     * It is safe to start the API after init_messaging_service_part
+     * completed
+     * \see init_messaging_service_part
+     */
+    future<> init_server_without_the_messaging_service_part(bind_messaging_port do_bind = bind_messaging_port::yes) {
+        return init_server(get_ring_delay().count(), do_bind);
     }
 
-    future<> init_server(int delay);
+    future<> init_server(int delay, bind_messaging_port do_bind = bind_messaging_port::yes);
 
     future<> drain_on_shutdown();
 
@@ -410,7 +453,7 @@ public:
 #endif
 private:
     bool should_bootstrap();
-    void prepare_to_join(std::vector<inet_address> loaded_endpoints);
+    void prepare_to_join(std::vector<inet_address> loaded_endpoints, bind_messaging_port do_bind = bind_messaging_port::yes);
     void register_features();
     void join_token_ring(int delay);
 public:
@@ -688,6 +731,7 @@ private:
     future<> replicate_to_all_cores();
     future<> do_replicate_to_all_cores();
     serialized_action _replicate_action;
+    serialized_action _update_pending_ranges_action;
 private:
     /**
      * Replicates token_metadata contents on shard0 instance to other shards.
@@ -2241,10 +2285,30 @@ public:
     const gms::feature& cluster_supports_schema_tables_v3() const {
         return _schema_tables_v3;
     }
+
+    bool cluster_supports_reading_correctly_serialized_range_tombstones() const {
+        return bool(_correct_non_compound_range_tombstones);
+    }
+
+    bool cluster_supports_write_failure_reply() const {
+        return bool(_write_failure_reply_feature);
+    }
+
+    bool cluster_supports_xxhash_digest_algorithm() const {
+        return bool(_xxhash_feature);
+    }
+
+    bool cluster_supports_roles() const {
+        return bool(_roles_feature);
+    }
+
+    bool cluster_supports_la_sstable() const {
+        return bool(_la_sstable_feature);
+    }
 };
 
-inline future<> init_storage_service(distributed<database>& db) {
-    return service::get_storage_service().start(std::ref(db));
+inline future<> init_storage_service(distributed<database>& db, sharded<auth::service>& auth_service) {
+    return service::get_storage_service().start(std::ref(db), std::ref(auth_service));
 }
 
 inline future<> deinit_storage_service() {

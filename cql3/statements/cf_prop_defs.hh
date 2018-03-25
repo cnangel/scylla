@@ -47,6 +47,11 @@
 #include "database.hh"
 #include "schema_builder.hh"
 #include "compaction_strategy.hh"
+#include "utils/UUID.hh"
+
+namespace db {
+class extensions;
+}
 
 namespace cql3 {
 
@@ -72,6 +77,8 @@ public:
     static const sstring KW_COMPRESSION;
     static const sstring KW_CRC_CHECK_CHANCE;
 
+    static const sstring KW_ID;
+
     static const sstring COMPACTION_STRATEGY_CLASS_KEY;
     static const sstring COMPACTION_ENABLED_KEY;
 
@@ -82,7 +89,7 @@ public:
 private:
     std::experimental::optional<sstables::compaction_strategy_type> _compaction_strategy_class;
 public:
-    void validate();
+    void validate(const db::extensions&);
     std::map<sstring, sstring> get_compaction_options() const;
     stdx::optional<std::map<sstring, sstring>> get_compression_options() const;
 #if 0
@@ -104,8 +111,9 @@ public:
 #endif
     int32_t get_default_time_to_live() const;
     int32_t get_gc_grace_seconds() const;
+    stdx::optional<utils::UUID> get_id() const;
 
-    void apply_to_builder(schema_builder& builder);
+    void apply_to_builder(schema_builder& builder, const db::extensions&);
     void validate_minimum_int(const sstring& field, int32_t minimum_value, int32_t default_value) const;
 };
 

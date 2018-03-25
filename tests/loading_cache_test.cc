@@ -22,11 +22,13 @@
 #include <boost/test/unit_test.hpp>
 #include "utils/loading_shared_values.hh"
 #include "utils/loading_cache.hh"
+#include <seastar/core/aligned_buffer.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/util/defer.hh>
 
 
 #include "seastarx.hh"
@@ -49,12 +51,6 @@ static int rand_int(int max) {
     return uni(rng);
 }
 
-
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type general_disk_error;
-thread_local disk_error_signal_type commit_error;
-
 static const sstring test_file_name = "loading_cache_test.txt";
 static const sstring test_string = "1";
 static bool file_prepared = false;
@@ -75,9 +71,16 @@ static future<> prepare() {
 
     return open_file_dma((boost::filesystem::path(get_tmpdir().path) / test_file_name.c_str()).c_str(), open_flags::create | open_flags::wo).then([] (file f) {
         return do_with(std::move(f), [] (file& f) {
-            return f.dma_write(0, test_string.c_str(), test_string.size() + 1).then([] (size_t s) {
-                BOOST_REQUIRE_EQUAL(s, test_string.size() + 1);
+            auto size = test_string.size() + 1;
+            auto aligned_size = align_up(size, f.disk_write_dma_alignment());
+            auto buf = allocate_aligned_buffer<char>(aligned_size, f.disk_write_dma_alignment());
+            auto wbuf = buf.get();
+            std::copy_n(test_string.c_str(), size, wbuf);
+            return f.dma_write(0, wbuf, aligned_size).then([aligned_size, buf = std::move(buf)] (size_t s) {
+                BOOST_REQUIRE_EQUAL(s, aligned_size);
                 file_prepared = true;
+            }).finally([&f] () mutable {
+                return f.close();
             });
         });
     });
@@ -86,11 +89,14 @@ static future<> prepare() {
 static future<sstring> loader(const int& k) {
     return open_file_dma((boost::filesystem::path(get_tmpdir().path) / test_file_name.c_str()).c_str(), open_flags::ro).then([] (file f) -> future<sstring> {
         return do_with(std::move(f), [] (file& f) -> future<sstring> {
-            return f.dma_read_exactly<char>(0, test_string.size() + 1).then([] (auto buf) {
+            auto size = align_up(test_string.size() + 1, f.disk_read_dma_alignment());
+            return f.dma_read_exactly<char>(0, size).then([] (auto buf) {
                 sstring str(buf.get());
                 BOOST_REQUIRE_EQUAL(str, test_string);
                 ++load_count;
                 return make_ready_future<sstring>(std::move(str));
+            }).finally([&f] () mutable {
+                return f.close();
             });
         });
     });
@@ -207,6 +213,7 @@ SEASTAR_TEST_CASE(test_loading_cache_loading_same_key) {
         std::vector<int> ivec(num_loaders);
         load_count = 0;
         utils::loading_cache<int, sstring> loading_cache(num_loaders, 1s, test_logger);
+        auto stop_cache_reload = seastar::defer([&loading_cache] { loading_cache.stop().get(); });
 
         prepare().get();
 
@@ -219,7 +226,6 @@ SEASTAR_TEST_CASE(test_loading_cache_loading_same_key) {
         // "loader" must be called exactly once
         BOOST_REQUIRE_EQUAL(load_count, 1);
         BOOST_REQUIRE_EQUAL(loading_cache.size(), 1);
-        loading_cache.stop().get();
     });
 }
 
@@ -229,6 +235,7 @@ SEASTAR_TEST_CASE(test_loading_cache_loading_different_keys) {
         std::vector<int> ivec(num_loaders);
         load_count = 0;
         utils::loading_cache<int, sstring> loading_cache(num_loaders, 1s, test_logger);
+        auto stop_cache_reload = seastar::defer([&loading_cache] { loading_cache.stop().get(); });
 
         prepare().get();
 
@@ -240,7 +247,6 @@ SEASTAR_TEST_CASE(test_loading_cache_loading_different_keys) {
 
         BOOST_REQUIRE_EQUAL(load_count, num_loaders);
         BOOST_REQUIRE_EQUAL(loading_cache.size(), num_loaders);
-        loading_cache.stop().get();
     });
 }
 
@@ -248,6 +254,7 @@ SEASTAR_TEST_CASE(test_loading_cache_loading_expiry_eviction) {
     return seastar::async([] {
         using namespace std::chrono;
         utils::loading_cache<int, sstring> loading_cache(num_loaders, 20ms, test_logger);
+        auto stop_cache_reload = seastar::defer([&loading_cache] { loading_cache.stop().get(); });
 
         prepare().get();
 
@@ -263,7 +270,6 @@ SEASTAR_TEST_CASE(test_loading_cache_loading_expiry_eviction) {
             [] { return sleep(40ms); }
         ).get();
         BOOST_REQUIRE(loading_cache.find(0) == loading_cache.end());
-        loading_cache.stop().get();
     });
 }
 
@@ -272,11 +278,11 @@ SEASTAR_TEST_CASE(test_loading_cache_loading_reloading) {
         using namespace std::chrono;
         load_count = 0;
         utils::loading_cache<int, sstring, utils::loading_cache_reload_enabled::yes> loading_cache(num_loaders, 100ms, 20ms, test_logger, loader);
+        auto stop_cache_reload = seastar::defer([&loading_cache] { loading_cache.stop().get(); });
         prepare().get();
         loading_cache.get_ptr(0, loader).discard_result().get();
         sleep(60ms).get();
         BOOST_REQUIRE_MESSAGE(load_count >= 2, format("load_count is {}", load_count));
-        loading_cache.stop().get();
     });
 }
 
@@ -285,6 +291,7 @@ SEASTAR_TEST_CASE(test_loading_cache_max_size_eviction) {
         using namespace std::chrono;
         load_count = 0;
         utils::loading_cache<int, sstring> loading_cache(1, 1s, test_logger);
+        auto stop_cache_reload = seastar::defer([&loading_cache] { loading_cache.stop().get(); });
 
         prepare().get();
 
@@ -294,7 +301,6 @@ SEASTAR_TEST_CASE(test_loading_cache_max_size_eviction) {
 
         BOOST_REQUIRE_EQUAL(load_count, num_loaders);
         BOOST_REQUIRE_EQUAL(loading_cache.size(), 1);
-        loading_cache.stop().get();
     });
 }
 
@@ -303,6 +309,7 @@ SEASTAR_TEST_CASE(test_loading_cache_reload_during_eviction) {
         using namespace std::chrono;
         load_count = 0;
         utils::loading_cache<int, sstring, utils::loading_cache_reload_enabled::yes> loading_cache(1, 100ms, 10ms, test_logger, loader);
+        auto stop_cache_reload = seastar::defer([&loading_cache] { loading_cache.stop().get(); });
 
         prepare().get();
 
@@ -316,6 +323,5 @@ SEASTAR_TEST_CASE(test_loading_cache_reload_during_eviction) {
         ).get();
 
         BOOST_REQUIRE_EQUAL(loading_cache.size(), 1);
-        loading_cache.stop().get();
     });
 }

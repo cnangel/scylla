@@ -22,6 +22,74 @@
 #pragma once
 
 #include "partition_version.hh"
+#include "row_cache.hh"
+#include <boost/algorithm/cxx11/any_of.hpp>
+
+class partition_snapshot_row_cursor;
+
+// A non-owning reference to a row inside partition_snapshot which
+// maintains it's position and thus can be kept across reference invalidation points.
+class partition_snapshot_row_weakref final {
+    mutation_partition::rows_type::iterator _it;
+    partition_snapshot::change_mark _change_mark;
+    position_in_partition _pos = position_in_partition::min();
+    bool _in_latest = false;
+public:
+    partition_snapshot_row_weakref() = default;
+    // Makes this object point to a row pointed to by given partition_snapshot_row_cursor.
+    explicit partition_snapshot_row_weakref(const partition_snapshot_row_cursor&);
+    explicit partition_snapshot_row_weakref(std::nullptr_t) {}
+    partition_snapshot_row_weakref(partition_snapshot& snp, mutation_partition::rows_type::iterator it, bool in_latest)
+        : _it(it)
+        , _change_mark(snp.get_change_mark())
+        , _pos(it->position())
+        , _in_latest(in_latest)
+    { }
+    partition_snapshot_row_weakref& operator=(const partition_snapshot_row_cursor&);
+    partition_snapshot_row_weakref& operator=(std::nullptr_t) noexcept {
+        _change_mark = {};
+        return *this;
+    }
+    // Returns true iff the pointer is pointing at a row.
+    explicit operator bool() const { return _change_mark != partition_snapshot::change_mark(); }
+public:
+    // Returns the position of the row.
+    // Call only when pointing at a row.
+    const position_in_partition& position() const { return _pos; }
+    // Returns true iff the object is valid.
+    bool valid(partition_snapshot& snp) { return snp.get_change_mark() == _change_mark; }
+    // Call only when valid.
+    bool is_in_latest_version() const { return _in_latest; }
+    // Brings the object back to validity and returns true iff the snapshot contains the row.
+    // When not pointing at a row, returns false.
+    bool refresh(partition_snapshot& snp) {
+        auto snp_cm = snp.get_change_mark();
+        if (snp_cm == _change_mark) {
+            return true;
+        }
+        if (!_change_mark) {
+            return false;
+        }
+        _change_mark = snp_cm;
+        rows_entry::compare less(*snp.schema());
+        _in_latest = true;
+        for (auto&& v : snp.versions()) {
+            auto& rows = v.partition().clustered_rows();
+            _it = rows.find(_pos, less);
+            if (_it != rows.end()) {
+                return true;
+            }
+            _in_latest = false;
+        }
+        return false;
+    }
+    rows_entry* operator->() const {
+        return &*_it;
+    }
+    rows_entry& operator*() const {
+        return *_it;
+    }
+};
 
 // Allows iterating over rows of mutation_partition represented by given partition_snapshot.
 //
@@ -35,8 +103,10 @@
 // back to validity by calling maybe_refresh(), or advance_to().
 //
 // Insertion of row entries after cursor's position invalidates the cursor.
+// Exceptions thrown from mutators invalidate the cursor.
 //
 class partition_snapshot_row_cursor final {
+    friend class partition_snapshot_row_weakref;
     struct position_in_version {
         mutation_partition::rows_type::iterator it;
         mutation_partition::rows_type::iterator end;
@@ -58,6 +128,8 @@ class partition_snapshot_row_cursor final {
     std::vector<position_in_version> _heap;
     std::vector<mutation_partition::rows_type::iterator> _iterators;
     std::vector<position_in_version> _current_row;
+    bool _continuous;
+    bool _dummy;
     position_in_partition _position;
     partition_snapshot::change_mark _change_mark;
 
@@ -65,12 +137,45 @@ class partition_snapshot_row_cursor final {
     void recreate_current_row() {
         position_in_version::less_compare heap_less(_schema);
         position_in_partition::equal_compare eq(_schema);
+        _continuous = false;
+        _dummy = true;
         do {
             boost::range::pop_heap(_heap, heap_less);
+            memory::on_alloc_point();
+            rows_entry& e = *_heap.back().it;
+            _dummy &= bool(e.dummy());
+            _continuous |= bool(e.continuous());
             _current_row.push_back(_heap.back());
             _heap.pop_back();
         } while (!_heap.empty() && eq(_current_row[0].it->position(), _heap[0].it->position()));
+
+        if (boost::algorithm::any_of(_heap, [] (auto&& v) { return v.it->continuous(); })) {
+            // FIXME: Optimize by dropping dummy() entries.
+            _continuous = true;
+        }
+
         _position = position_in_partition(_current_row[0].it->position());
+    }
+
+    void prepare_heap(position_in_partition_view lower_bound) {
+        memory::on_alloc_point();
+        rows_entry::compare less(_schema);
+        position_in_version::less_compare heap_less(_schema);
+        _heap.clear();
+        _current_row.clear();
+        _iterators.clear();
+        int version_no = 0;
+        for (auto&& v : _snp.versions()) {
+            auto& rows = v.partition().clustered_rows();
+            auto pos = rows.lower_bound(lower_bound, less);
+            auto end = rows.end();
+            _iterators.push_back(pos);
+            if (pos != end) {
+                _heap.push_back({pos, end, version_no});
+            }
+            ++version_no;
+        }
+        boost::range::make_heap(_heap, heap_less);
     }
 public:
     partition_snapshot_row_cursor(const schema& s, partition_snapshot& snp)
@@ -78,9 +183,7 @@ public:
         , _snp(snp)
         , _position(position_in_partition::static_row_tag_t{})
     { }
-    bool has_valid_row_from_latest_version() const {
-        return iterators_valid() && _current_row[0].version_no == 0;
-    }
+
     mutation_partition::rows_type::iterator get_iterator_in_latest_version() const {
         return _iterators[0];
     }
@@ -99,6 +202,8 @@ public:
     //   advance_to(position());
     //
     // but avoids work if not necessary.
+    //
+    // Changes to attributes of the current row (e.g. continuity) don't have to be reflected.
     bool maybe_refresh() {
         if (!iterators_valid()) {
             return advance_to(_position);
@@ -148,24 +253,9 @@ public:
     // May be called when cursor is not valid.
     // The cursor is valid after the call.
     // Must be called under reclaim lock.
+    // When throws, the cursor is invalidated and its position is not changed.
     bool advance_to(position_in_partition_view lower_bound) {
-        rows_entry::compare less(_schema);
-        position_in_version::less_compare heap_less(_schema);
-        _heap.clear();
-        _current_row.clear();
-        _iterators.clear();
-        int version_no = 0;
-        for (auto&& v : _snp.versions()) {
-            auto& rows = v.partition().clustered_rows();
-            auto pos = rows.lower_bound(lower_bound, less);
-            auto end = rows.end();
-            _iterators.push_back(pos);
-            if (pos != end) {
-                _heap.push_back({pos, end, version_no});
-            }
-            ++version_no;
-        }
-        boost::range::make_heap(_heap, heap_less);
+        prepare_heap(lower_bound);
         _change_mark = _snp.get_change_mark();
         bool found = no_clustering_row_between(_schema, lower_bound, _heap[0].it->position());
         recreate_current_row();
@@ -175,7 +265,9 @@ public:
     // Advances the cursor to the next row.
     // If there is no next row, returns false and the cursor is no longer pointing at a row.
     // Can be only called on a valid cursor pointing at a row.
+    // When throws, the cursor is invalidated and its position is not changed.
     bool next() {
+        memory::on_alloc_point();
         position_in_version::less_compare heap_less(_schema);
         assert(iterators_valid());
         for (auto&& curr : _current_row) {
@@ -194,24 +286,98 @@ public:
         return true;
     }
 
-    // Can be called only when cursor is valid and pointing at a row.
-    bool continuous() const { return bool(_current_row[0].it->continuous()); }
+    // Can be called when cursor is pointing at a row.
+    bool continuous() const { return _continuous; }
 
-    // Can be called only when cursor is valid and pointing at a row.
-    bool dummy() const { return bool(_current_row[0].it->dummy()); }
+    // Can be called when cursor is pointing at a row.
+    bool dummy() const { return _dummy; }
 
     // Can be called only when cursor is valid and pointing at a row, and !dummy().
     const clustering_key& key() const { return _current_row[0].it->key(); }
 
     // Can be called only when cursor is valid and pointing at a row.
-    mutation_fragment row() const {
+    mutation_fragment row(bool digest_requested) const {
         auto it = _current_row.begin();
-        auto mf = mutation_fragment(clustering_row(*it->it));
+        auto row = it->it;
+        if (digest_requested) {
+            row->row().cells().prepare_hash(_schema, column_kind::regular_column);
+        }
+        auto mf = mutation_fragment(clustering_row(*row));
         auto& cr = mf.as_mutable_clustering_row();
         for (++it; it != _current_row.end(); ++it) {
             cr.apply(_schema, *it->it);
         }
         return mf;
+    }
+
+    struct ensure_result {
+        rows_entry& row;
+        bool inserted = false;
+    };
+
+    // Makes sure that a rows_entry for the row under the cursor exists in the latest version.
+    // Doesn't change logical value or continuity of the snapshot.
+    // Can be called only when cursor is valid and pointing at a row.
+    // The cursor remains valid after the call and points at the same row as before.
+    ensure_result ensure_entry_in_latest() {
+        auto&& rows = _snp.version()->partition().clustered_rows();
+        auto latest_i = get_iterator_in_latest_version();
+        rows_entry& latest = *latest_i;
+        if (is_in_latest_version()) {
+            if (_snp.at_latest_version()) {
+                _snp.tracker()->touch(latest);
+            }
+            return {latest, false};
+        } else {
+            // Copy row from older version because rows in evictable versions must
+            // hold values which are independently complete to be consistent on eviction.
+            auto e = current_allocator().construct<rows_entry>(*_current_row[0].it);
+            e->set_continuous(latest_i != rows.end() && latest_i->continuous());
+            _snp.tracker()->insert(*e);
+            rows.insert_before(latest_i, *e);
+            return {*e, true};
+        }
+    }
+
+    // Returns a pointer to rows_entry with given position in latest version or
+    // creates a neutral one, provided that it belongs to a continuous range.
+    // Otherwise returns nullptr.
+    // Doesn't change logical value of mutation_partition or continuity of the snapshot.
+    // The cursor doesn't have to be valid.
+    // The cursor is invalid after the call.
+    // Assumes the snapshot is evictable.
+    stdx::optional<ensure_result> ensure_entry_if_complete(position_in_partition_view pos) {
+        prepare_heap(pos);
+        if (!_heap.empty()) {
+            recreate_current_row();
+            position_in_partition::equal_compare eq(_schema);
+            if (eq(position(), pos)) {
+                if (dummy()) {
+                    return stdx::nullopt;
+                }
+                return ensure_entry_in_latest();
+            } else if (!continuous()) {
+                return stdx::nullopt;
+            }
+        }
+        auto&& rows = _snp.version()->partition().clustered_rows();
+        auto latest_i = get_iterator_in_latest_version();
+        auto e = current_allocator().construct<rows_entry>(_schema, pos, is_dummy(!pos.is_clustering_row()),
+            is_continuous(latest_i != rows.end() && latest_i->continuous()));
+        _snp.tracker()->insert(*e);
+        rows.insert_before(latest_i, *e);
+        return ensure_result{*e, true};
+    }
+
+    // Brings the entry pointed to by the cursor to the front of the LRU
+    // Cursor must be valid and pointing at a row.
+    void touch() {
+        // We cannot bring entries from non-latest versions to the front because that
+        // could result violate ordering invariant for the LRU, which states that older versions
+        // must be evicted first. Needed to keep the snapshot consistent.
+        if (_snp.at_latest_version() && is_in_latest_version()) {
+            _snp.tracker()->touch(*get_iterator_in_latest_version());
+        }
     }
 
     // Can be called when cursor is pointing at a row, even when invalid.
@@ -220,11 +386,22 @@ public:
     }
 
     bool is_in_latest_version() const;
-    bool previous_row_in_latest_version_has_key(const clustering_key_prefix& key) const;
-    void set_continuous(bool val);
+
+    // Reads the rest of the partition into a mutation_partition object.
+    // There must be at least one entry ahead of the cursor.
+    // The cursor must be pointing at a row and valid.
+    // The cursor will not be pointing at a row after this.
+    mutation_partition read_partition() {
+        mutation_partition p(_schema.shared_from_this());
+        do {
+            p.clustered_row(_schema, position(), is_dummy(dummy()), is_continuous(continuous()))
+                .apply(_schema, row(false).as_clustering_row());
+        } while (next());
+        return p;
+    }
 
     friend std::ostream& operator<<(std::ostream& out, const partition_snapshot_row_cursor& cur) {
-        out << "{cursor: position=" << cur._position << ", ";
+        out << "{cursor: position=" << cur._position << ", cont=" << cur.continuous() << ", ";
         if (!cur.iterators_valid()) {
             return out << " iterators invalid}";
         }
@@ -237,14 +414,29 @@ public:
             first = false;
             out << v.version_no;
         }
-        out << "], heap=[";
+        out << "], heap=[\n  ";
         first = true;
         for (auto&& v : cur._heap) {
             if (!first) {
-                out << ", ";
+                out << ",\n  ";
             }
             first = false;
-            out << "{v=" << v.version_no << ", pos=" << v.it->position() << "}";
+            out << "{v=" << v.version_no << ", pos=" << v.it->position() << ", cont=" << v.it->continuous() << "}";
+        }
+        out << "], iterators=[\n  ";
+        first = true;
+        auto v = cur._snp.versions().begin();
+        for (auto&& i : cur._iterators) {
+            if (!first) {
+                out << ",\n  ";
+            }
+            first = false;
+            if (i == v->partition().clustered_rows().end()) {
+                out << "end";
+            } else {
+                out << i->position();
+            }
+            ++v;
         }
         return out << "]}";
     };
@@ -256,17 +448,17 @@ bool partition_snapshot_row_cursor::is_in_latest_version() const {
 }
 
 inline
-bool partition_snapshot_row_cursor::previous_row_in_latest_version_has_key(const clustering_key_prefix& key) const {
-    if (_current_row[0].it == _snp.version()->partition().clustered_rows().begin()) {
-        return false;
-    }
-    auto prev_it = _current_row[0].it;
-    --prev_it;
-    clustering_key_prefix::equality eq(_schema);
-    return eq(prev_it->key(), key);
-}
+partition_snapshot_row_weakref::partition_snapshot_row_weakref(const partition_snapshot_row_cursor& c)
+    : _it(c._current_row[0].it)
+    , _change_mark(c._change_mark)
+    , _pos(c._position)
+    , _in_latest(c.is_in_latest_version())
+{ }
 
 inline
-void partition_snapshot_row_cursor::set_continuous(bool val) {
-    _current_row[0].it->set_continuous(val);
+partition_snapshot_row_weakref& partition_snapshot_row_weakref::operator=(const partition_snapshot_row_cursor& c) {
+    auto tmp = partition_snapshot_row_weakref(c);
+    this->~partition_snapshot_row_weakref();
+    new (this) partition_snapshot_row_weakref(std::move(tmp));
+    return *this;
 }

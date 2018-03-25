@@ -24,7 +24,9 @@
 #include "core/future.hh"
 #include "core/iostream.hh"
 #include "sstables/exceptions.hh"
+#include "sstables/progress_monitor.hh"
 #include <seastar/core/byteorder.hh>
+#include <seastar/util/variant_utils.hh>
 
 template<typename T>
 static inline T consume_be(temporary_buffer<char>& p) {
@@ -35,6 +37,16 @@ static inline T consume_be(temporary_buffer<char>& p) {
 
 namespace data_consumer {
 enum class proceed { no, yes };
+using processing_result = boost::variant<proceed, skip_bytes>;
+
+inline bool operator==(const processing_result& result, proceed value) {
+    const proceed* p = boost::get<proceed>(&result);
+    return (p != nullptr && *p == value);
+}
+
+inline bool operator!=(const processing_result& result, proceed value) {
+    return !(result == value);
+}
 
 template <typename StateProcessor>
 class continuous_data_consumer {
@@ -44,9 +56,9 @@ class continuous_data_consumer {
     };
 protected:
     input_stream<char> _input;
-    uint64_t _stream_position;
+    sstables::reader_position_tracker _stream_position;
     // remaining length of input to read (if <0, continue until end of file).
-    int64_t _remain;
+    uint64_t _remain;
 
     // state machine progress:
     enum class prestate {
@@ -219,11 +231,10 @@ private:
     }
 public:
     continuous_data_consumer(input_stream<char>&& input, uint64_t start, uint64_t maxlen)
-            : _input(std::move(input)), _stream_position(start), _remain(maxlen) {}
+            : _input(std::move(input)), _stream_position(sstables::reader_position_tracker{start, maxlen}), _remain(maxlen) {}
 
-    template<typename Consumer>
-    future<> consume_input(Consumer& c) {
-        return _input.consume(c);
+    future<> consume_input() {
+        return _input.consume(state_processor());
     }
 
     // some states do not consume input (its only exists to perform some
@@ -234,7 +245,10 @@ public:
         return state_processor().non_consuming();
     }
 
-    inline proceed process(temporary_buffer<char>& data) {
+    using unconsumed_remainder = input_stream<char>::unconsumed_remainder;
+    using consumption_result_type = consumption_result<char>;
+
+    inline processing_result process(temporary_buffer<char>& data) {
         while (data || non_consuming()) {
             process_buffer(data);
             // If _prestate is set to something other than prestate::NONE
@@ -248,18 +262,17 @@ public:
                 return proceed::yes;
             }
             auto ret = state_processor().process_state(data);
-            if (__builtin_expect(ret == proceed::no, 0)) {
+            if (__builtin_expect(ret != proceed::yes, 0)) {
                 return ret;
             }
         }
         return proceed::yes;
     }
 
-    using unconsumed_remainder = input_stream<char>::unconsumed_remainder;
     // called by input_stream::consume():
-    future<unconsumed_remainder>
+    future<consumption_result_type>
     operator()(temporary_buffer<char> data) {
-        if (_remain >= 0 && data.size() >= (uint64_t)_remain) {
+        if (data.size() >= _remain) {
             // We received more data than we actually care about, so process
             // the beginning of the buffer, and return the rest to the stream
             auto segment = data.share(0, _remain);
@@ -267,52 +280,67 @@ public:
             data.trim_front(_remain - segment.size());
             auto len = _remain - segment.size();
             _remain -= len;
-            _stream_position += len;
+            _stream_position.position += len;
             if (_remain == 0 && ret == proceed::yes) {
                 verify_end_state();
             }
-            return make_ready_future<unconsumed_remainder>(std::move(data));
+            return make_ready_future<consumption_result_type>(stop_consuming<char>{std::move(data)});
         } else if (data.empty()) {
             // End of file
             verify_end_state();
-            return make_ready_future<unconsumed_remainder>(std::move(data));
+            return make_ready_future<consumption_result_type>(stop_consuming<char>{std::move(data)});
         } else {
             // We can process the entire buffer (if the consumer wants to).
             auto orig_data_size = data.size();
-            _stream_position += data.size();
-            if (process(data) == proceed::yes) {
+            _stream_position.position += data.size();
+            auto result = process(data);
+            return visit(result, [this, &data, orig_data_size] (proceed value) {
+                _remain -= orig_data_size - data.size();
+                _stream_position.position -= data.size();
+                if (value == proceed::yes) {
+                    return make_ready_future<consumption_result_type>(continue_consuming{});
+                } else {
+                    return make_ready_future<consumption_result_type>(stop_consuming<char>{std::move(data)});
+                }
+            }, [this, &data, orig_data_size](skip_bytes skip) {
+                // we only expect skip_bytes to be used if reader needs to skip beyond the provided buffer
+                // otherwise it should just trim_front and proceed as usual
                 assert(data.size() == 0);
-                if (_remain >= 0) {
-                    _remain -= orig_data_size;
+                _remain -= orig_data_size;
+                if (skip.get_value() >= _remain) {
+                    _stream_position.position += _remain;
+                    _remain = 0;
+                    verify_end_state();
+                    return make_ready_future<consumption_result_type>(stop_consuming<char>{std::move(data)});
                 }
-                return make_ready_future<unconsumed_remainder>();
-            } else {
-                if (_remain >= 0) {
-                    _remain -= orig_data_size - data.size();
-                }
-                _stream_position -= data.size();
-                return make_ready_future<unconsumed_remainder>(std::move(data));
-            }
+                _stream_position.position += skip.get_value();
+                _remain -= skip.get_value();
+                return make_ready_future<consumption_result_type>(std::move(skip));
+            });
         }
     }
 
     future<> fast_forward_to(size_t begin, size_t end) {
-        assert(begin >= _stream_position);
-        auto n = begin - _stream_position;
-        _stream_position = begin;
+        assert(begin >= _stream_position.position);
+        auto n = begin - _stream_position.position;
+        _stream_position.position = begin;
 
-        assert(end >= _stream_position);
-        _remain = end - _stream_position;
+        assert(end >= _stream_position.position);
+        _remain = end - _stream_position.position;
 
         _prestate = prestate::NONE;
         return _input.skip(n);
     }
 
     future<> skip_to(size_t begin) {
-        return fast_forward_to(begin, _stream_position + _remain);
+        return fast_forward_to(begin, _stream_position.position + _remain);
     }
 
     uint64_t position() const {
+        return _stream_position.position;
+    }
+
+    const sstables::reader_position_tracker& reader_position() {
         return _stream_position;
     }
 

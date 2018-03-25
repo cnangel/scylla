@@ -22,9 +22,9 @@
 #include "memtable.hh"
 #include "database.hh"
 #include "frozen_mutation.hh"
-#include "sstable_mutation_readers.hh"
 #include "stdx.hh"
 #include "partition_snapshot_reader.hh"
+#include "schema_upgrader.hh"
 
 memtable::memtable(schema_ptr schema, dirty_memory_manager& dmm, memtable_list* memtable_list)
         : logalloc::region(dmm.region_group())
@@ -59,21 +59,20 @@ void memtable::clear() noexcept {
 
 future<> memtable::clear_gently() noexcept {
     return futurize_apply([this] {
-        static thread_local seastar::thread_scheduling_group scheduling_group(std::chrono::milliseconds(1), 0.2);
-        auto attr = seastar::thread_attributes();
-        attr.scheduling_group = &scheduling_group;
-        auto t = std::make_unique<seastar::thread>(attr, [this] {
+        auto t = std::make_unique<seastar::thread>([this] {
             auto& alloc = allocator();
 
             auto p = std::move(partitions);
             while (!p.empty()) {
-                auto batch_size = std::min<size_t>(p.size(), 32);
                 auto dirty_before = dirty_size();
                 with_allocator(alloc, [&] () noexcept {
-                    while (batch_size--) {
+                    while (!p.empty()) {
                         p.erase_and_dispose(p.begin(), [&] (auto e) {
                             alloc.destroy(e);
                         });
+                        if (need_preempt()) {
+                            break;
+                        }
                     }
                 });
                 remove_flushed_memory(dirty_before - dirty_size());
@@ -153,7 +152,7 @@ memtable::slice(const dht::partition_range& range) const {
     }
 }
 
-class iterator_reader: public mutation_reader::impl {
+class iterator_reader {
     lw_shared_ptr<memtable> _memtable;
     schema_ptr _schema;
     const dht::partition_range* _range;
@@ -214,10 +213,12 @@ protected:
         }
     }
 
-    void advance() {
-        memtable_entry& e = *_i;
-        _last = e.key();
+    void advance_iterator() {
         ++_i;
+    }
+
+    void update_last(dht::decorated_key last) {
+        _last = std::move(last);
     }
 
     logalloc::allocating_section& read_section() {
@@ -244,74 +245,137 @@ protected:
         return {};
     }
 
-    mutation_reader delegate_reader(const dht::partition_range& delegate,
+    flat_mutation_reader delegate_reader(const dht::partition_range& delegate,
                                     const query::partition_slice& slice,
                                     const io_priority_class& pc,
                                     streamed_mutation::forwarding fwd,
                                     mutation_reader::forwarding fwd_mr) {
-        auto ret = (*_memtable->_underlying)(_schema, delegate, slice, pc, nullptr, fwd, fwd_mr);
+        auto ret = _memtable->_underlying->make_reader(_schema, delegate, slice, pc, nullptr, fwd, fwd_mr);
         _memtable = {};
         _last = {};
         return ret;
     }
-public:
-    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
+    future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) {
         _range = &pr;
         _last = { };
         return make_ready_future<>();
     }
 };
 
-class scanning_reader final: public iterator_reader {
+class scanning_reader final : public flat_mutation_reader::impl, private iterator_reader {
     stdx::optional<dht::partition_range> _delegate_range;
-    mutation_reader _delegate;
+    stdx::optional<flat_mutation_reader> _delegate;
     const io_priority_class& _pc;
     const query::partition_slice& _slice;
-    streamed_mutation::forwarding _fwd;
     mutation_reader::forwarding _fwd_mr;
+
+    struct consumer {
+        scanning_reader* _reader;
+        explicit consumer(scanning_reader* r) : _reader(r) {}
+        stop_iteration operator()(mutation_fragment mf) {
+            _reader->push_mutation_fragment(std::move(mf));
+            return stop_iteration(_reader->is_buffer_full());
+        }
+    };
+
+    future<> fill_buffer_from_delegate(db::timeout_clock::time_point timeout) {
+        return _delegate->consume_pausable(consumer(this), timeout).then([this] {
+            if (_delegate->is_end_of_stream() && _delegate->is_buffer_empty()) {
+                if (_delegate_range) {
+                    _end_of_stream = true;
+                } else {
+                    _delegate = { };
+                }
+            }
+        });
+    }
+
 public:
      scanning_reader(schema_ptr s,
                      lw_shared_ptr<memtable> m,
                      const dht::partition_range& range,
                      const query::partition_slice& slice,
                      const io_priority_class& pc,
-                     streamed_mutation::forwarding fwd,
                      mutation_reader::forwarding fwd_mr)
-         : iterator_reader(std::move(s), std::move(m), range)
+         : impl(s)
+         , iterator_reader(s, std::move(m), range)
          , _pc(pc)
          , _slice(slice)
-         , _fwd(fwd)
          , _fwd_mr(fwd_mr)
      { }
 
-    virtual future<streamed_mutation_opt> operator()() override {
-        if (_delegate_range) {
-            return _delegate();
-        }
-
-        // FIXME: Use cache. See column_family::make_reader().
-        _delegate_range = get_delegate_range();
-        if (_delegate_range) {
-            _delegate = delegate_reader(*_delegate_range, _slice, _pc, _fwd, _fwd_mr);
-            return _delegate();
-        }
-
-        return read_section()(region(), [&] {
-            return with_linearized_managed_bytes([&] {
-                memtable_entry* e = fetch_entry();
-                if (!e) {
-                    return make_ready_future<streamed_mutation_opt>(stdx::nullopt);
+    virtual future<> fill_buffer(db::timeout_clock::time_point timeout) override {
+        return do_until([this] { return is_end_of_stream() || is_buffer_full(); }, [this, timeout] {
+            if (!_delegate) {
+                _delegate_range = get_delegate_range();
+                if (_delegate_range) {
+                    _delegate = delegate_reader(*_delegate_range, _slice, _pc, streamed_mutation::forwarding::no, _fwd_mr);
                 } else {
-                    auto ret =  make_ready_future<streamed_mutation_opt>(e->read(mtbl(), schema(), _slice, _fwd));
-                    advance();
-                    return ret;
+                    auto key_and_snp = read_section()(region(), [&] {
+                        return with_linearized_managed_bytes([&] () -> std::optional<std::pair<dht::decorated_key, lw_shared_ptr<partition_snapshot>>> {
+                            memtable_entry *e = fetch_entry();
+                            if (!e) {
+                                return { };
+                            } else {
+                                // FIXME: Introduce a memtable specific reader that will be returned from
+                                // memtable_entry::read and will allow filling the buffer without the overhead of
+                                // virtual calls, intermediate buffers and futures.
+                                auto key = e->key();
+                                auto snp = e->snapshot(*mtbl());
+                                advance_iterator();
+                                return std::pair(std::move(key), std::move(snp));
+                            }
+                        });
+                    });
+                    if (key_and_snp) {
+                        update_last(key_and_snp->first);
+                        auto cr = query::clustering_key_filter_ranges::get_ranges(*schema(), _slice, key_and_snp->first.key());
+                        auto snp_schema = key_and_snp->second->schema();
+                        bool digest_requested = _slice.options.contains<query::partition_slice::option::with_digest>();
+                        auto mpsr = make_partition_snapshot_flat_reader(snp_schema, std::move(key_and_snp->first), std::move(cr),
+                                        std::move(key_and_snp->second), digest_requested, region(), read_section(), mtbl(), streamed_mutation::forwarding::no);
+                        if (snp_schema->version() != schema()->version()) {
+                            _delegate = transform(std::move(mpsr), schema_upgrader(schema()));
+                        } else {
+                            _delegate = std::move(mpsr);
+                        }
+                    } else {
+                        _end_of_stream = true;
+                    }
                 }
-            });
+            }
+
+            return is_end_of_stream() ? make_ready_future<>() : fill_buffer_from_delegate(timeout);
         });
     }
-    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
-        return _delegate_range ? _delegate.fast_forward_to(pr)
-                               : iterator_reader::fast_forward_to(pr);
+    virtual void next_partition() override {
+        clear_buffer_to_next_partition();
+        if (is_buffer_empty()) {
+            if (!_delegate_range) {
+                _delegate = {};
+            } else {
+                _delegate->next_partition();
+            }
+        }
+    }
+    virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
+        _end_of_stream = false;
+        clear_buffer();
+        if (_delegate_range) {
+            return _delegate->fast_forward_to(pr, timeout);
+        } else {
+            _delegate = {};
+            return iterator_reader::fast_forward_to(pr, timeout);
+        }
+    }
+    virtual future<> fast_forward_to(position_range cr, db::timeout_clock::time_point timeout) override {
+        throw std::runtime_error("This reader can't be fast forwarded to another partition.");
+    };
+    virtual size_t buffer_size() const override {
+        if (_delegate) {
+            return flat_mutation_reader::impl::buffer_size() + _delegate->buffer_size();
+        }
+        return flat_mutation_reader::impl::buffer_size();
     }
 };
 
@@ -347,13 +411,9 @@ public:
     ~flush_memory_accounter() {
         assert(_mt._flushed_memory <= _mt.occupancy().used_space());
     }
-    void account_component(memtable_entry& e) {
-        auto delta = _mt.allocator().object_memory_size_in_allocator(&e)
-                     + e.external_memory_usage_without_rows();
-        update_bytes_read(delta);
-    }
-    void account_component(partition_snapshot& snp) {
-        update_bytes_read(_mt.allocator().object_memory_size_in_allocator(&*snp.version()));
+    uint64_t compute_size(memtable_entry& e, partition_snapshot& snp) {
+        return e.size_in_allocator_without_rows(_mt.allocator())
+            + _mt.allocator().object_memory_size_in_allocator(&*snp.version());
     }
 };
 
@@ -391,42 +451,99 @@ public:
     }
 };
 
-class flush_reader final : public iterator_reader {
+class flush_reader final : public flat_mutation_reader::impl, private iterator_reader {
+    // FIXME: Similarly to scanning_reader we have an underlying
+    // flat_mutation_reader for each partition. This is suboptimal.
+    // Partition snapshot reader should be devirtualised and called directly
+    // without using any intermediate buffers.
+    flat_mutation_reader_opt _partition_reader;
     flush_memory_accounter _flushed_memory;
 public:
     flush_reader(schema_ptr s, lw_shared_ptr<memtable> m)
-        : iterator_reader(std::move(s), m, query::full_partition_range)
+        : impl(s)
+        , iterator_reader(std::move(s), m, query::full_partition_range)
         , _flushed_memory(*m)
     {}
     flush_reader(const flush_reader&) = delete;
     flush_reader(flush_reader&&) = delete;
     flush_reader& operator=(flush_reader&&) = delete;
     flush_reader& operator=(const flush_reader&) = delete;
-
-    virtual future<streamed_mutation_opt> operator()() override {
-        return read_section()(region(), [&] {
-            return with_linearized_managed_bytes([&] {
+private:
+    void get_next_partition() {
+        uint64_t component_size = 0;
+        auto key_and_snp = read_section()(region(), [&] {
+            return with_linearized_managed_bytes([&] () -> std::optional<std::pair<dht::decorated_key, lw_shared_ptr<partition_snapshot>>> {
                 memtable_entry* e = fetch_entry();
-                if (!e) {
-                    return make_ready_future<streamed_mutation_opt>(stdx::nullopt);
-                } else {
-                    auto cr = query::clustering_key_filter_ranges::get_ranges(*schema(), schema()->full_slice(), e->key().key());
-                    auto snp = e->partition().read(region(), schema());
-                    auto mpsr = make_partition_snapshot_reader<partition_snapshot_accounter>(schema(), e->key(), std::move(cr),
-                            snp, region(), read_section(), mtbl(), streamed_mutation::forwarding::no, _flushed_memory);
-                    _flushed_memory.account_component(*e);
-                    _flushed_memory.account_component(*snp);
-                    auto ret = make_ready_future<streamed_mutation_opt>(std::move(mpsr));
-                    advance();
-                    return ret;
+                if (e) {
+                    auto dk = e->key();
+                    auto snp = e->snapshot(*mtbl());
+                    component_size = _flushed_memory.compute_size(*e, *snp);
+                    advance_iterator();
+                    return std::pair(std::move(dk), std::move(snp));
+                }
+                return { };
+            });
+        });
+        if (key_and_snp) {
+            _flushed_memory.update_bytes_read(component_size);
+            update_last(key_and_snp->first);
+            auto cr = query::clustering_key_filter_ranges::get_ranges(*schema(), schema()->full_slice(), key_and_snp->first.key());
+            auto snp_schema = key_and_snp->second->schema();
+            auto mpsr = make_partition_snapshot_flat_reader<partition_snapshot_accounter>(snp_schema, std::move(key_and_snp->first), std::move(cr),
+                            std::move(key_and_snp->second), false, region(), read_section(), mtbl(), streamed_mutation::forwarding::no, _flushed_memory);
+            if (snp_schema->version() != schema()->version()) {
+                _partition_reader = transform(std::move(mpsr), schema_upgrader(schema()));
+            } else {
+                _partition_reader = std::move(mpsr);
+            }
+        }
+    }
+public:
+    virtual future<> fill_buffer(db::timeout_clock::time_point timeout) override {
+        return do_until([this] { return is_end_of_stream() || is_buffer_full(); }, [this, timeout] {
+            if (!_partition_reader) {
+                get_next_partition();
+                if (!_partition_reader) {
+                    _end_of_stream = true;
+                    return make_ready_future<>();
+                }
+            }
+            return _partition_reader->consume_pausable([this] (mutation_fragment mf) {
+                push_mutation_fragment(std::move(mf));
+                return stop_iteration(is_buffer_full());
+            }, timeout).then([this] {
+                if (_partition_reader->is_end_of_stream() && _partition_reader->is_buffer_empty()) {
+                    _partition_reader = stdx::nullopt;
                 }
             });
         });
     }
+    virtual void next_partition() override {
+        clear_buffer_to_next_partition();
+        if (is_buffer_empty()) {
+            _partition_reader = stdx::nullopt;
+        }
+    }
+    virtual future<> fast_forward_to(const dht::partition_range&, db::timeout_clock::time_point timeout) override {
+        throw std::bad_function_call();
+    }
+    virtual future<> fast_forward_to(position_range, db::timeout_clock::time_point timeout) override {
+        throw std::bad_function_call();
+    }
+    virtual size_t buffer_size() const override {
+        if (_partition_reader) {
+            return flat_mutation_reader::impl::buffer_size() + _partition_reader->buffer_size();
+        }
+        return flat_mutation_reader::impl::buffer_size();
+    }
 };
 
-mutation_reader
-memtable::make_reader(schema_ptr s,
+lw_shared_ptr<partition_snapshot> memtable_entry::snapshot(memtable& mtbl) {
+    return _pe.read(mtbl.region(), _schema, no_cache_tracker);
+}
+
+flat_mutation_reader
+memtable::make_flat_reader(schema_ptr s,
                       const dht::partition_range& range,
                       const query::partition_slice& slice,
                       const io_priority_class& pc,
@@ -435,29 +552,48 @@ memtable::make_reader(schema_ptr s,
                       mutation_reader::forwarding fwd_mr) {
     if (query::is_single_partition(range)) {
         const query::ring_position& pos = range.start()->value();
-        return _read_section(*this, [&] {
-        managed_bytes::linearization_context_guard lcg;
-        auto i = partitions.find(pos, memtable_entry::compare(_schema));
-        if (i != partitions.end()) {
-            upgrade_entry(*i);
-            return make_reader_returning(i->read(shared_from_this(), s, slice, fwd));
-        } else {
-            return make_empty_reader();
-        }
+        auto snp = _read_section(*this, [&] () -> lw_shared_ptr<partition_snapshot> {
+            managed_bytes::linearization_context_guard lcg;
+            auto i = partitions.find(pos, memtable_entry::compare(_schema));
+            if (i != partitions.end()) {
+                upgrade_entry(*i);
+                return i->snapshot(*this);
+            } else {
+                return { };
+            }
         });
+        if (!snp) {
+            return make_empty_flat_reader(std::move(s));
+        }
+        auto dk = pos.as_decorated_key();
+        auto cr = query::clustering_key_filter_ranges::get_ranges(*s, slice, dk.key());
+        auto snp_schema = snp->schema();
+        bool digest_requested = slice.options.contains<query::partition_slice::option::with_digest>();
+        auto rd = make_partition_snapshot_flat_reader(snp_schema, std::move(dk), std::move(cr), std::move(snp), digest_requested,
+                                                      *this, _read_section, shared_from_this(), fwd);
+        if (snp_schema->version() != s->version()) {
+            return transform(std::move(rd), schema_upgrader(s));
+        } else {
+            return rd;
+        }
     } else {
-        return make_mutation_reader<scanning_reader>(std::move(s), shared_from_this(), range, slice, pc, fwd, fwd_mr);
+        auto res = make_flat_mutation_reader<scanning_reader>(std::move(s), shared_from_this(), range, slice, pc, fwd_mr);
+        if (fwd == streamed_mutation::forwarding::yes) {
+            return make_forwardable(std::move(res));
+        } else {
+            return std::move(res);
+        }
     }
 }
 
-mutation_reader
+flat_mutation_reader
 memtable::make_flush_reader(schema_ptr s, const io_priority_class& pc) {
     if (group()) {
-        return make_mutation_reader<flush_reader>(std::move(s), shared_from_this());
+        return make_flat_mutation_reader<flush_reader>(s, shared_from_this());
     } else {
         auto& full_slice = s->full_slice();
-        return make_mutation_reader<scanning_reader>(std::move(s), shared_from_this(),
-            query::full_partition_range, full_slice, pc, streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
+        return make_flat_mutation_reader<scanning_reader>(std::move(s), shared_from_this(),
+            query::full_partition_range, full_slice, pc, mutation_reader::forwarding::no);
     }
 }
 
@@ -472,8 +608,8 @@ memtable::update(db::rp_handle&& h) {
 
 future<>
 memtable::apply(memtable& mt) {
-    return do_with(mt.make_reader(_schema), [this] (auto&& rd) mutable {
-        return consume(rd, [self = this->shared_from_this(), &rd] (mutation&& m) {
+    return do_with(mt.make_flat_reader(_schema), [this] (auto&& rd) mutable {
+        return consume_partitions(rd, [self = this->shared_from_this(), &rd] (mutation&& m) {
             self->apply(m);
             return stop_iteration::no;
         });
@@ -518,7 +654,7 @@ mutation_source memtable::as_data_source() {
             tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) {
-        return mt->make_reader(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+        return mt->make_flat_reader(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
     });
 }
 
@@ -545,27 +681,12 @@ bool memtable::is_flushed() const {
     return bool(_underlying);
 }
 
-streamed_mutation
-memtable_entry::read(lw_shared_ptr<memtable> mtbl,
-        const schema_ptr& target_schema,
-        const query::partition_slice& slice,
-        streamed_mutation::forwarding fwd) {
-    auto cr = query::clustering_key_filter_ranges::get_ranges(*_schema, slice, _key.key());
-    if (_schema->version() != target_schema->version()) {
-        auto mp = mutation_partition(_pe.squashed(_schema, target_schema), *target_schema, std::move(cr));
-        mutation m = mutation(target_schema, _key, std::move(mp));
-        return streamed_mutation_from_mutation(std::move(m), fwd);
-    }
-    auto snp = _pe.read(mtbl->region(), _schema);
-    return make_partition_snapshot_reader(_schema, _key, std::move(cr), snp, *mtbl, mtbl->_read_section, mtbl, fwd);
-}
-
 void memtable::upgrade_entry(memtable_entry& e) {
     if (e._schema != _schema) {
         assert(!reclaiming_enabled());
         with_allocator(allocator(), [this, &e] {
           with_linearized_managed_bytes([&] {
-            e.partition().upgrade(e._schema, _schema);
+            e.partition().upgrade(e._schema, _schema, no_cache_tracker);
             e._schema = _schema;
           });
         });
@@ -574,4 +695,13 @@ void memtable::upgrade_entry(memtable_entry& e) {
 
 void memtable::set_schema(schema_ptr new_schema) noexcept {
     _schema = std::move(new_schema);
+}
+
+std::ostream& operator<<(std::ostream& out, memtable& mt) {
+    logalloc::reclaim_lock rl(mt);
+    return out << "{memtable: [" << ::join(",\n", mt.partitions) << "]}";
+}
+
+std::ostream& operator<<(std::ostream& out, const memtable_entry& mt) {
+    return out << "{" << mt.key() << ": " << mt.partition() << "}";
 }

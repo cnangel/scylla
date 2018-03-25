@@ -41,11 +41,6 @@
 #include "db/commitlog/rp_set.hh"
 #include "log.hh"
 
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
-
 using namespace db;
 
 template<typename Func>
@@ -67,6 +62,7 @@ static future<> cl_test(commitlog::config cfg, Func && f) {
 template<typename Func>
 static future<> cl_test(Func && f) {
     commitlog::config cfg;
+    cfg.metrics_category_name = "commitlog";
     return cl_test(cfg, std::forward<Func>(f));
 }
 
@@ -335,7 +331,7 @@ SEASTAR_TEST_CASE(test_commitlog_reader){
                         std::sort(ids.begin(), ids.end());
                         auto id = ids.front();
                         auto i = std::find_if(segments.begin(), segments.end(), [id](sstring filename) {
-                            commitlog::descriptor desc(filename);
+                            commitlog::descriptor desc(filename, db::commitlog::descriptor::FILENAME_PREFIX);
                             return desc.id == id;
                         });
                         if (i == segments.end()) {
@@ -367,6 +363,8 @@ static future<> corrupt_segment(sstring seg, uint64_t off, uint32_t value) {
                 auto dst = buf.get();
                 auto size = buf.size();
                 return f.dma_write(0, dst, size).then([buf = std::move(buf)](size_t) {});
+            }).finally([&f] {
+                return f.close();
             });
         });
     });

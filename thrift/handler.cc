@@ -179,6 +179,8 @@ concept bool Aggregator =
 )
 }
 
+enum class query_order { no, yes };
+
 class thrift_handler : public CassandraCobSvIf {
     distributed<database>& _db;
     distributed<cql3::query_processor>& _query_processor;
@@ -196,10 +198,10 @@ private:
         });
     }
 public:
-    explicit thrift_handler(distributed<database>& db, distributed<cql3::query_processor>& qp)
+    explicit thrift_handler(distributed<database>& db, distributed<cql3::query_processor>& qp, auth::service& auth_service)
         : _db(db)
         , _query_processor(qp)
-        , _query_state(service::client_state::for_external_thrift_calls())
+        , _query_state(service::client_state::for_external_thrift_calls(auth_service))
     { }
 
     const sstring& current_keyspace() const {
@@ -213,8 +215,9 @@ public:
     void login(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const AuthenticationRequest& auth_request) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auth::authenticator::credentials_map creds(auth_request.credentials.begin(), auth_request.credentials.end());
-            return auth::authenticator::get().authenticate(creds).then([this] (auto user) {
-                _query_state.get_client_state().set_login(std::move(user));
+            auto& auth_service = *_query_state.get_client_state().get_auth_service();
+            return auth_service.underlying_authenticator().authenticate(creds).then([this] (auto user) {
+                _query_state.get_client_state().set_login(::make_shared<auth::authenticated_user>(std::move(user)));
             });
         });
     }
@@ -262,21 +265,17 @@ public:
             auto pranges = make_partition_ranges(*schema, keys);
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
             return f.then([schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
-                return service::get_local_storage_proxy().query(
-                        schema,
-                        cmd,
-                        std::move(pranges),
-                        cl_from_thrift(consistency_level),
-                        nullptr).then([schema, cmd, cell_limit, keys = std::move(keys)](auto result) {
-                    return query::result_view::do_with(*result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
+                return service::get_local_storage_proxy().query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level)).then(
+                        [schema, cmd, cell_limit, keys = std::move(keys)](service::storage_proxy::coordinator_query_result qr) {
+                    return query::result_view::do_with(*qr.query_result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
                         if (schema->is_counter()) {
                             counter_column_aggregator aggregator(*schema, cmd->slice, cell_limit, std::move(keys));
                             v.consume(cmd->slice, aggregator);
-                            return aggregator.release_as_map();
+                            return aggregator.release();
                         }
-                        column_aggregator aggregator(*schema, cmd->slice, cell_limit, std::move(keys));
+                        column_aggregator<query_order::no> aggregator(*schema, cmd->slice, cell_limit, std::move(keys));
                         v.consume(cmd->slice, aggregator);
-                        return aggregator.release_as_map();
+                        return aggregator.release();
                     });
                 });
             });
@@ -293,16 +292,12 @@ public:
             auto pranges = make_partition_ranges(*schema, keys);
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
             return f.then([schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
-                return service::get_local_storage_proxy().query(
-                        schema,
-                        cmd,
-                        std::move(pranges),
-                        cl_from_thrift(consistency_level),
-                        nullptr).then([schema, cmd, cell_limit, keys = std::move(keys)](auto&& result) {
-                    return query::result_view::do_with(*result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
+                return service::get_local_storage_proxy().query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level)).then(
+                        [schema, cmd, cell_limit, keys = std::move(keys)](service::storage_proxy::coordinator_query_result qr) {
+                    return query::result_view::do_with(*qr.query_result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
                         column_counter counter(*schema, cmd->slice, cell_limit, std::move(keys));
                         v.consume(cmd->slice, counter);
-                        return counter.release_as_map();
+                        return counter.release();
                     });
                 });
             });
@@ -333,13 +328,9 @@ public:
             }
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
             return f.then([schema, cmd, prange = std::move(prange), consistency_level] () mutable {
-                return service::get_local_storage_proxy().query(
-                        schema,
-                        cmd,
-                        std::move(prange),
-                        cl_from_thrift(consistency_level),
-                        nullptr).then([schema, cmd](auto result) {
-                    return query::result_view::do_with(*result, [schema, cmd](query::result_view v) {
+                return service::get_local_storage_proxy().query(schema, cmd, std::move(prange), cl_from_thrift(consistency_level)).then(
+                        [schema, cmd](service::storage_proxy::coordinator_query_result qr) {
+                    return query::result_view::do_with(*qr.query_result, [schema, cmd](query::result_view v) {
                         return to_key_slices(*schema, cmd->slice, v, std::numeric_limits<uint32_t>::max());
                     });
                 });
@@ -399,8 +390,9 @@ public:
             range = {dht::partition_range::make_singular(std::move(range[0].start()->value()))};
         }
         auto range1 = range; // query() below accepts an rvalue, so need a copy to reuse later
-        return service::get_local_storage_proxy().query(schema, cmd, std::move(range), consistency_level, nullptr).then([schema, cmd, column_limit](auto result) {
-            return query::result_view::do_with(*result, [schema, cmd, column_limit](query::result_view v) {
+        return service::get_local_storage_proxy().query(schema, cmd, std::move(range), consistency_level).then(
+                [schema, cmd, column_limit](service::storage_proxy::coordinator_query_result qr) {
+            return query::result_view::do_with(*qr.query_result, [schema, cmd, column_limit](query::result_view v) {
                 return to_key_slices(*schema, cmd->slice, v, column_limit);
             });
         }).then([schema, cmd, column_limit, range = std::move(range1), consistency_level, start_key = std::move(start_key), end = std::move(end), &output](auto&& slices) mutable {
@@ -471,7 +463,7 @@ public:
                 throw make_exception<InvalidRequestException>("Cannot modify Materialized Views directly");
             }
 
-            mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
+            mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key)));
             add_to_mutation(*schema, column, m_to_apply);
             return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
                 return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
@@ -485,7 +477,7 @@ public:
                 fail(unimplemented::cause::SUPER);
             }
 
-            mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
+            mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key)));
             add_to_mutation(*schema, column, m_to_apply);
             return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
                 return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
@@ -506,7 +498,7 @@ public:
                 throw make_exception<InvalidRequestException>("Cannot modify Materialized Views directly");
             }
 
-            mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
+            mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key)));
 
             if (column_path.__isset.super_column) {
                 fail(unimplemented::cause::SUPER);
@@ -529,7 +521,7 @@ public:
 
     void remove_counter(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_path.column_family, [&](schema_ptr schema) {
-            mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
+            mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key)));
 
             auto timestamp = api::new_timestamp();
             if (column_path.__isset.super_column) {
@@ -642,14 +634,10 @@ public:
             auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), row_limit);
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
             return f.then([dk = std::move(dk), cmd, schema, column_limit = request.count, cl = request.consistency_level] {
-                return service::get_local_storage_proxy().query(
-                        schema,
-                        cmd,
-                        {dht::partition_range::make_singular(dk)},
-                        cl_from_thrift(cl),
-                        nullptr).then([schema, cmd, column_limit](auto result) {
-                    return query::result_view::do_with(*result, [schema, cmd, column_limit](query::result_view v) {
-                        column_aggregator aggregator(*schema, cmd->slice, column_limit, { });
+                return service::get_local_storage_proxy().query(schema, cmd, {dht::partition_range::make_singular(dk)}, cl_from_thrift(cl)).then(
+                        [schema, cmd, column_limit](service::storage_proxy::coordinator_query_result qr) {
+                    return query::result_view::do_with(*qr.query_result, [schema, cmd, column_limit](query::result_view v) {
+                        column_aggregator<query_order::no> aggregator(*schema, cmd->slice, column_limit, { });
                         v.consume(cmd->slice, aggregator);
                         auto cols = aggregator.release();
                         return !cols.empty() ? std::move(cols.begin()->second) : std::vector<ColumnOrSuperColumn>();
@@ -1528,33 +1516,53 @@ private:
         return bytes_to_string(to_legacy(*s.partition_key_type(), key));
     }
 
+    template<typename Aggregator, query_order QueryOrder>
+    struct partition_index;
+
     template<typename Aggregator>
+    struct partition_index<Aggregator, query_order::no> {
+        using partition_type = std::map<std::string, typename Aggregator::type>;
+        partition_type _aggregation;
+        partition_index(std::vector<std::string>&& expected) {
+            // For compatibility reasons, return expected keys even if they don't exist
+            for (auto&& k : expected) {
+                _aggregation[std::move(k)] = { };
+            }
+        }
+        typename Aggregator::type* begin_aggregation(std::string partition_key) {
+            return &_aggregation[std::move(partition_key)];
+        }
+    };
+    template<typename Aggregator>
+    struct partition_index<Aggregator, query_order::yes> {
+        using partition_type = std::vector<std::pair<std::string, typename Aggregator::type>>;
+        partition_type _aggregation;
+        partition_index(std::vector<std::string>&& expected) {
+        }
+        typename Aggregator::type* begin_aggregation(std::string partition_key) {
+            _aggregation.emplace_back(std::move(partition_key), typename Aggregator::type());
+            return &_aggregation.back().second;
+        }
+    };
+
+    template<typename Aggregator, query_order QueryOrder>
     GCC6_CONCEPT( requires thrift::Aggregator<Aggregator> )
     class column_visitor : public Aggregator {
         const schema& _s;
         const query::partition_slice& _slice;
         const uint32_t _cell_limit;
         uint32_t _current_cell_limit;
-        std::map<std::string, typename Aggregator::type> _aggregation;
         typename Aggregator::type* _current_aggregation;
+        partition_index<Aggregator, QueryOrder> _index;
     public:
         column_visitor(const schema& s, const query::partition_slice& slice, uint32_t cell_limit, std::vector<std::string>&& expected)
-                : _s(s), _slice(slice), _cell_limit(cell_limit), _current_cell_limit(0) {
-            // For compatibility reasons, return expected keys even if they don't exist
-            for (auto&& k : expected) {
-                _aggregation[std::move(k)] = { };
-            }
+                : _s(s), _slice(slice), _cell_limit(cell_limit), _current_cell_limit(0), _index(std::move(expected)) {
         }
-        std::vector<std::pair<std::string, typename Aggregator::type>> release() {
-            return std::vector<std::pair<std::string, typename Aggregator::type>>(
-                        boost::make_move_iterator(_aggregation.begin()),
-                        boost::make_move_iterator(_aggregation.end()));
-        }
-        std::map<std::string, typename Aggregator::type>&& release_as_map() {
-            return std::move(_aggregation);
+        typename partition_index<Aggregator, QueryOrder>::partition_type&& release() {
+            return std::move(_index._aggregation);
         }
         void accept_new_partition(const partition_key& key, uint32_t row_count) {
-            _current_aggregation = &_aggregation[partition_key_to_string(_s, key)];
+            _current_aggregation = _index.begin_aggregation(partition_key_to_string(_s, key));
             _current_cell_limit = _cell_limit;
         }
         void accept_new_partition(uint32_t row_count) {
@@ -1589,21 +1597,22 @@ private:
             current_cols->emplace_back(make_column_or_supercolumn(name, cell));
         }
     };
-    using column_aggregator = column_visitor<column_or_supercolumn_builder>;
+    template<query_order QueryOrder>
+    using column_aggregator = column_visitor<column_or_supercolumn_builder, QueryOrder>;
     struct counter_column_or_supercolumn_builder {
         using type = std::vector<ColumnOrSuperColumn>;
         void on_column(std::vector<ColumnOrSuperColumn>* current_cols, const bytes& name, const query::result_atomic_cell_view& cell) {
             current_cols->emplace_back(make_counter_column_or_supercolumn(name, cell));
         }
     };
-    using counter_column_aggregator = column_visitor<counter_column_or_supercolumn_builder>;
+    using counter_column_aggregator = column_visitor<counter_column_or_supercolumn_builder, query_order::no>;
     struct counter {
         using type = int32_t;
         void on_column(int32_t* current_cols, const bytes_view& name, const query::result_atomic_cell_view& cell) {
             *current_cols += 1;
         }
     };
-    using column_counter = column_visitor<counter>;
+    using column_counter = column_visitor<counter, query_order::no>;
     static dht::partition_range_vector make_partition_range(const schema& s, const KeyRange& range) {
         if (range.__isset.row_filter) {
             fail(unimplemented::cause::INDEXES);
@@ -1669,7 +1678,7 @@ private:
                  dht::partition_range::bound(std::move(end), true)}};
     }
     static std::vector<KeySlice> to_key_slices(const schema& s, const query::partition_slice& slice, query::result_view v, uint32_t cell_limit) {
-        column_aggregator aggregator(s, slice, cell_limit, { });
+        column_aggregator<query_order::yes> aggregator(s, slice, cell_limit, { });
         v.consume(slice, aggregator);
         auto&& cols = aggregator.release();
         std::vector<KeySlice> ret;
@@ -1865,7 +1874,7 @@ private:
             }
             schemas.emplace_back(schema);
             for (auto&& key_mutations : cf_key.second) {
-                mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key_mutations.first)), schema);
+                mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key_mutations.first)));
                 for (auto&& m : key_mutations.second) {
                     add_to_mutation(*schema, m, m_to_apply);
                 }
@@ -1879,13 +1888,15 @@ private:
 class handler_factory : public CassandraCobSvIfFactory {
     distributed<database>& _db;
     distributed<cql3::query_processor>& _query_processor;
+    auth::service& _auth_service;
 public:
     explicit handler_factory(distributed<database>& db,
-                             distributed<cql3::query_processor>& qp)
-        : _db(db), _query_processor(qp) {}
+                             distributed<cql3::query_processor>& qp,
+                             auth::service& auth_service)
+        : _db(db), _query_processor(qp), _auth_service(auth_service) {}
     typedef CassandraCobSvIf Handler;
     virtual CassandraCobSvIf* getHandler(const ::apache::thrift::TConnectionInfo& connInfo) {
-        return new thrift_handler(_db, _query_processor);
+        return new thrift_handler(_db, _query_processor, _auth_service);
     }
     virtual void releaseHandler(CassandraCobSvIf* handler) {
         delete handler;
@@ -1893,6 +1904,6 @@ public:
 };
 
 std::unique_ptr<CassandraCobSvIfFactory>
-create_handler_factory(distributed<database>& db, distributed<cql3::query_processor>& qp) {
-    return std::make_unique<handler_factory>(db, qp);
+create_handler_factory(distributed<database>& db, distributed<cql3::query_processor>& qp, auth::service& auth_service) {
+    return std::make_unique<handler_factory>(db, qp, auth_service);
 }

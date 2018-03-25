@@ -125,7 +125,7 @@ list(REMOVE_ITEM SEASTAR_CFLAGS "-DHAVE_GCC6_CONCEPTS")
 #
 # For ease of browsing the source code, we always pretend that DPDK is enabled.
 target_compile_options(scylla PUBLIC
-        -std=gnu++14
+        -std=gnu++1z
         -DHAVE_DPDK
         -DHAVE_HWLOC
         "${SEASTAR_CFLAGS}")
@@ -137,4 +137,5 @@ target_include_directories(scylla PUBLIC
         ${SEASTAR_DPDK_INCLUDE_DIRS}
         ${SEASTAR_INCLUDE_DIRS}
         ${Boost_INCLUDE_DIRS}
+        xxhash
         build/release/gen)

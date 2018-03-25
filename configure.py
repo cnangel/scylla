@@ -20,8 +20,10 @@
 # along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-import os, os.path, textwrap, argparse, sys, shlex, subprocess, tempfile, re
+import os, os.path, textwrap, argparse, sys, shlex, subprocess, tempfile, re, platform
 from distutils.spawn import find_executable
+
+tempfile.tempdir = "./build/tmp"
 
 configure_args = str.join(' ', [shlex.quote(x) for x in sys.argv[1:]])
 
@@ -83,17 +85,33 @@ def pkg_config(option, package):
     return output.decode('utf-8').strip()
 
 def try_compile(compiler, source = '', flags = []):
-    with tempfile.NamedTemporaryFile() as sfile:
-        sfile.file.write(bytes(source, 'utf-8'))
-        sfile.file.flush()
-        return subprocess.call([compiler, '-x', 'c++', '-o', '/dev/null', '-c', sfile.name] + args.user_cflags.split() + flags,
-                               stdout = subprocess.DEVNULL,
-                               stderr = subprocess.DEVNULL) == 0
+    return try_compile_and_link(compiler, source, flags = flags + ['-c'])
 
-def warning_supported(warning, compiler):
+def ensure_tmp_dir_exists():
+    if not os.path.exists(tempfile.tempdir):
+        os.makedirs(tempfile.tempdir)
+
+def try_compile_and_link(compiler, source = '', flags = []):
+    ensure_tmp_dir_exists()
+    with tempfile.NamedTemporaryFile() as sfile:
+        ofile = tempfile.mktemp()
+        try:
+            sfile.file.write(bytes(source, 'utf-8'))
+            sfile.file.flush()
+            # We can't write to /dev/null, since in some cases (-ftest-coverage) gcc will create an auxiliary
+            # output file based on the name of the output file, and "/dev/null.gcsa" is not a good name
+            return subprocess.call([compiler, '-x', 'c++', '-o', ofile, sfile.name] + args.user_cflags.split() + flags,
+                                   stdout = subprocess.DEVNULL,
+                                   stderr = subprocess.DEVNULL) == 0
+        finally:
+            if os.path.exists(ofile):
+                os.unlink(ofile)
+
+def flag_supported(flag, compiler):
     # gcc ignores -Wno-x even if it is not supported
-    adjusted = re.sub('^-Wno-', '-W', warning)
-    return try_compile(flags = ['-Werror', adjusted], compiler = compiler)
+    adjusted = re.sub('^-Wno-', '-W', flag)
+    split = adjusted.split(' ')
+    return try_compile(flags = ['-Werror'] + split, compiler = compiler)
 
 def debug_flag(compiler):
     src_with_auto = textwrap.dedent('''\
@@ -106,6 +124,14 @@ def debug_flag(compiler):
         return '-g'
     else:
         print('Note: debug information disabled; upgrade your compiler')
+        return ''
+
+def gold_supported(compiler):
+    src_main = 'int main(int argc, char **argv) { return 0; }'
+    if try_compile_and_link(source = src_main, flags = ['-fuse-ld=gold'], compiler = compiler):
+        return '-fuse-ld=gold'
+    else:
+        print('Note: gold not found; using default system linker')
         return ''
 
 def maybe_static(flag, libs):
@@ -133,6 +159,13 @@ class Thrift(object):
     def endswith(self, end):
         return self.source.endswith(end)
 
+def default_target_arch():
+    mach = platform.machine()
+    if platform.machine() in ['i386', 'i686', 'x86_64']:
+        return 'nehalem'
+    else:
+        return ''
+
 class Antlr3Grammar(object):
     def __init__(self, source):
         self.source = source
@@ -154,13 +187,13 @@ modes = {
     'debug': {
         'sanitize': '-fsanitize=address -fsanitize=leak -fsanitize=undefined',
         'sanitize_libs': '-lasan -lubsan',
-        'opt': '-O0 -DDEBUG -DDEBUG_SHARED_PTR -DDEFAULT_ALLOCATOR',
+        'opt': '-O0 -DDEBUG -DDEBUG_SHARED_PTR -DDEFAULT_ALLOCATOR -DDEBUG_LSA_SANITIZER',
         'libs': '',
     },
     'release': {
         'sanitize': '',
         'sanitize_libs': '',
-        'opt': '-O2',
+        'opt': '-O3',
         'libs': '',
     },
 }
@@ -168,7 +201,7 @@ modes = {
 scylla_tests = [
     'tests/mutation_test',
     'tests/mvcc_test',
-    'tests/streamed_mutation_test',
+    'tests/mutation_fragment_test',
     'tests/flat_mutation_reader_test',
     'tests/schema_registry_test',
     'tests/canonical_mutation_test',
@@ -178,6 +211,7 @@ scylla_tests = [
     'tests/partitioner_test',
     'tests/frozen_mutation_test',
     'tests/serialized_action_test',
+    'tests/hint_test',
     'tests/clustering_ranges_walker_test',
     'tests/perf/perf_mutation',
     'tests/lsa_async_eviction_test',
@@ -189,7 +223,7 @@ scylla_tests = [
     'tests/perf/perf_simple_query',
     'tests/perf/perf_fast_forward',
     'tests/perf/perf_cache_eviction',
-    'tests/cache_streamed_mutation_test',
+    'tests/cache_flat_mutation_reader_test',
     'tests/row_cache_stress_test',
     'tests/memory_footprint',
     'tests/perf/perf_sstable',
@@ -215,6 +249,7 @@ scylla_tests = [
     'tests/config_test',
     'tests/gossiping_property_file_snitch_test',
     'tests/ec2_snitch_test',
+    'tests/gce_snitch_test',
     'tests/snitch_reset_test',
     'tests/network_topology_strategy_test',
     'tests/query_processor_test',
@@ -236,11 +271,11 @@ scylla_tests = [
     'tests/database_test',
     'tests/nonwrapping_range_test',
     'tests/input_stream_test',
-    'tests/sstable_atomic_deletion_test',
     'tests/virtual_reader_test',
     'tests/view_schema_test',
     'tests/counter_test',
     'tests/cell_locker_test',
+    'tests/row_locker_test',
     'tests/streaming_histogram_test',
     'tests/duration_test',
     'tests/vint_serialization_test',
@@ -248,13 +283,28 @@ scylla_tests = [
     'tests/chunked_vector_test',
     'tests/loading_cache_test',
     'tests/castas_fcts_test',
+    'tests/big_decimal_test',
+    'tests/aggregate_fcts_test',
+    'tests/role_manager_test',
+    'tests/caching_options_test',
+    'tests/auth_resource_test',
+    'tests/cql_auth_query_test',
+    'tests/enum_set_test',
+    'tests/extensions_test',
+    'tests/cql_auth_syntax_test',
+    'tests/querier_cache',
+    'tests/querier_cache_resource_based_eviction',
+]
+
+perf_tests = [
+    'tests/perf/perf_mutation_readers'
 ]
 
 apps = [
     'scylla',
     ]
 
-tests = scylla_tests
+tests = scylla_tests + perf_tests
 
 other = [
     'iotune',
@@ -276,6 +326,8 @@ arg_parser.add_argument('--cflags', action = 'store', dest = 'user_cflags', defa
                         help = 'Extra flags for the C++ compiler')
 arg_parser.add_argument('--ldflags', action = 'store', dest = 'user_ldflags', default = '',
                         help = 'Extra flags for the linker')
+arg_parser.add_argument('--target', action = 'store', dest = 'target', default = default_target_arch(),
+                        help = 'Target architecture (-march)')
 arg_parser.add_argument('--compiler', action = 'store', dest = 'cxx', default = 'g++',
                         help = 'C++ compiler path')
 arg_parser.add_argument('--c-compiler', action='store', dest='cc', default='gcc',
@@ -294,6 +346,8 @@ arg_parser.add_argument('--static-thrift', dest = 'staticthrift', action = 'stor
             help = 'Link libthrift statically')
 arg_parser.add_argument('--static-boost', dest = 'staticboost', action = 'store_true',
             help = 'Link boost statically')
+arg_parser.add_argument('--static-yaml-cpp', dest = 'staticyamlcpp', action = 'store_true',
+            help = 'Link libyaml-cpp statically')
 arg_parser.add_argument('--tests-debuginfo', action = 'store', dest = 'tests_debuginfo', type = int, default = 0,
                         help = 'Enable(1)/disable(0)compiler debug information generation for tests')
 arg_parser.add_argument('--python', action = 'store', dest = 'python', default = 'python3',
@@ -302,6 +356,8 @@ add_tristate(arg_parser, name = 'hwloc', dest = 'hwloc', help = 'hwloc support')
 add_tristate(arg_parser, name = 'xen', dest = 'xen', help = 'Xen support')
 arg_parser.add_argument('--enable-gcc6-concepts', dest='gcc6_concepts', action='store_true', default=False,
                         help='enable experimental support for C++ Concepts as implemented in GCC 6')
+arg_parser.add_argument('--enable-alloc-failure-injector', dest='alloc_failure_injector', action='store_true', default=False,
+                        help='enable allocation failure injection')
 args = arg_parser.parse_args()
 
 defines = []
@@ -316,17 +372,17 @@ scylla_core = (['database.cc',
                  'schema_registry.cc',
                  'bytes.cc',
                  'mutation.cc',
-                 'streamed_mutation.cc',
+                 'mutation_fragment.cc',
                  'partition_version.cc',
                  'row_cache.cc',
                  'canonical_mutation.cc',
                  'frozen_mutation.cc',
                  'memtable.cc',
                  'schema_mutations.cc',
-                 'release.cc',
                  'supervisor.cc',
                  'utils/logalloc.cc',
                  'utils/large_bitset.cc',
+                 'utils/buffer_input_stream.cc',
                  'mutation_partition.cc',
                  'mutation_partition_view.cc',
                  'mutation_partition_serializer.cc',
@@ -334,7 +390,8 @@ scylla_core = (['database.cc',
                  'flat_mutation_reader.cc',
                  'mutation_query.cc',
                  'keys.cc',
-                 'counters.cc',
+                 'counters.cc',                 
+                 'compress.cc',
                  'sstables/sstables.cc',
                  'sstables/compress.cc',
                  'sstables/row.cc',
@@ -342,8 +399,8 @@ scylla_core = (['database.cc',
                  'sstables/compaction.cc',
                  'sstables/compaction_strategy.cc',
                  'sstables/compaction_manager.cc',
-                 'sstables/atomic_deletion.cc',
                  'sstables/integrity_checked_file_impl.cc',
+                 'sstables/prepended_input_stream.cc',
                  'transport/event.cc',
                  'transport/event_notifier.cc',
                  'transport/server.cc',
@@ -366,7 +423,6 @@ scylla_core = (['database.cc',
                  'cql3/statements/create_table_statement.cc',
                  'cql3/statements/create_view_statement.cc',
                  'cql3/statements/create_type_statement.cc',
-                 'cql3/statements/create_user_statement.cc',
                  'cql3/statements/drop_index_statement.cc',
                  'cql3/statements/drop_keyspace_statement.cc',
                  'cql3/statements/drop_table_statement.cc',
@@ -388,8 +444,6 @@ scylla_core = (['database.cc',
                  'cql3/statements/truncate_statement.cc',
                  'cql3/statements/alter_table_statement.cc',
                  'cql3/statements/alter_view_statement.cc',
-                 'cql3/statements/alter_user_statement.cc',
-                 'cql3/statements/drop_user_statement.cc',
                  'cql3/statements/list_users_statement.cc',
                  'cql3/statements/authorization_statement.cc',
                  'cql3/statements/permission_altering_statement.cc',
@@ -398,9 +452,10 @@ scylla_core = (['database.cc',
                  'cql3/statements/revoke_statement.cc',
                  'cql3/statements/alter_type_statement.cc',
                  'cql3/statements/alter_keyspace_statement.cc',
+                 'cql3/statements/role-management-statements.cc',
                  'cql3/update_parameters.cc',
                  'cql3/ut_name.cc',
-                 'cql3/user_options.cc',
+                 'cql3/role_name.cc',
                  'thrift/handler.cc',
                  'thrift/server.cc',
                  'thrift/thrift_validation.cc',
@@ -442,15 +497,16 @@ scylla_core = (['database.cc',
                  'db/commitlog/commitlog.cc',
                  'db/commitlog/commitlog_replayer.cc',
                  'db/commitlog/commitlog_entry.cc',
+                 'db/hints/manager.cc',
                  'db/config.cc',
+                 'db/extensions.cc',
                  'db/heat_load_balance.cc',
                  'db/index/secondary_index.cc',
                  'db/marshal/type_parser.cc',
                  'db/batchlog_manager.cc',
                  'db/view/view.cc',
+                 'db/view/row_locking.cc',
                  'index/secondary_index_manager.cc',
-                 'io/io.cc',
-                 'utils/utils.cc',
                  'utils/UUID_gen.cc',
                  'utils/i_filter.cc',
                  'utils/bloom_filter.cc',
@@ -486,7 +542,6 @@ scylla_core = (['database.cc',
                  'locator/network_topology_strategy.cc',
                  'locator/everywhere_replication_strategy.cc',
                  'locator/token_metadata.cc',
-                 'locator/locator.cc',
                  'locator/snitch_base.cc',
                  'locator/simple_snitch.cc',
                  'locator/rack_inferring_snitch.cc',
@@ -494,6 +549,7 @@ scylla_core = (['database.cc',
                  'locator/production_snitch_base.cc',
                  'locator/ec2_snitch.cc',
                  'locator/ec2_multi_region_snitch.cc',
+                 'locator/gce_snitch.cc',
                  'message/messaging_service.cc',
                  'service/client_state.cc',
                  'service/migration_task.cc',
@@ -520,15 +576,22 @@ scylla_core = (['database.cc',
                  'lister.cc',
                  'repair/repair.cc',
                  'exceptions/exceptions.cc',
-                 'auth/auth.cc',
+                 'auth/allow_all_authenticator.cc',
+                 'auth/allow_all_authorizer.cc',
                  'auth/authenticated_user.cc',
                  'auth/authenticator.cc',
-                 'auth/authorizer.cc',
+                 'auth/common.cc',
                  'auth/default_authorizer.cc',
-                 'auth/data_resource.cc',
+                 'auth/resource.cc',
+                 'auth/roles-metadata.cc',
                  'auth/password_authenticator.cc',
                  'auth/permission.cc',
+                 'auth/permissions_cache.cc',
+                 'auth/service.cc',
+                 'auth/standard_role_manager.cc',
                  'auth/transitional.cc',
+                 'auth/authentication_options.cc',
+                 'auth/role_or_anonymous.cc',
                  'tracing/tracing.cc',
                  'tracing/trace_keyspace_helper.cc',
                  'tracing/trace_state.cc',
@@ -538,6 +601,8 @@ scylla_core = (['database.cc',
                  'disk-error-handler.cc',
                  'duration.cc',
                  'vint-serialization.cc',
+                 'utils/arch/powerpc/crc32-vpmsum/crc32_wrapper.cc',
+                 'querier.cc',
                  ]
                 + [Antlr3Grammar('cql3/Cql.g')]
                 + [Thrift('interface/cassandra.thrift', 'Cassandra')]
@@ -602,7 +667,7 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/cache_temperature.idl.hh',
         ]
 
-scylla_tests_dependencies = scylla_core + api + idls + [
+scylla_tests_dependencies = scylla_core + idls + [
     'tests/cql_test_env.cc',
     'tests/cql_assertions.cc',
     'tests/result_set_assertions.cc',
@@ -615,7 +680,7 @@ scylla_tests_seastar_deps = [
 ]
 
 deps = {
-    'scylla': idls + ['main.cc'] + scylla_core + api,
+    'scylla': idls + ['main.cc', 'release.cc'] + scylla_core + api,
 }
 
 pure_boost_tests = set([
@@ -638,6 +703,11 @@ pure_boost_tests = set([
     'tests/vint_serialization_test',
     'tests/compress_test',
     'tests/chunked_vector_test',
+    'tests/big_decimal_test',
+    'tests/caching_options_test',
+    'tests/auth_resource_test',
+    'tests/enum_set_test',
+    'tests/cql_auth_syntax_test',
 ])
 
 tests_not_using_seastar_test_framework = set([
@@ -656,6 +726,7 @@ tests_not_using_seastar_test_framework = set([
     'tests/memory_footprint',
     'tests/gossip',
     'tests/perf/perf_sstable',
+    'tests/querier_cache_resource_based_eviction',
 ]) | pure_boost_tests
 
 for t in tests_not_using_seastar_test_framework:
@@ -668,7 +739,14 @@ for t in scylla_tests:
         deps[t] += scylla_tests_dependencies 
         deps[t] += scylla_tests_seastar_deps
     else:
-        deps[t] += scylla_core + api + idls + ['tests/cql_test_env.cc']
+        deps[t] += scylla_core + idls + ['tests/cql_test_env.cc']
+
+perf_tests_seastar_deps = [
+    'seastar/tests/perf/perf_tests.cc'
+]
+
+for t in perf_tests:
+    deps[t] = [t + '.cc'] + scylla_tests_dependencies + perf_tests_seastar_deps
 
 deps['tests/sstable_test'] += ['tests/sstable_datafile_test.cc', 'tests/sstable_utils.cc']
 deps['tests/mutation_reader_test'] += ['tests/sstable_utils.cc']
@@ -680,6 +758,7 @@ deps['tests/murmur_hash_test'] = ['bytes.cc', 'utils/murmur_hash.cc', 'tests/mur
 deps['tests/allocation_strategy_test'] = ['tests/allocation_strategy_test.cc', 'utils/logalloc.cc', 'utils/dynamic_bitset.cc']
 deps['tests/log_heap_test'] = ['tests/log_heap_test.cc']
 deps['tests/anchorless_list_test'] = ['tests/anchorless_list_test.cc']
+deps['tests/perf/perf_fast_forward'] += ['release.cc']
 
 warnings = [
     '-Wno-mismatched-tags',  # clang-only
@@ -695,13 +774,24 @@ warnings = [
     '-Wno-misleading-indentation',
     '-Wno-overflow',
     '-Wno-noexcept-type',
+    '-Wno-nonnull-compare'
     ]
 
 warnings = [w
             for w in warnings
-            if warning_supported(warning = w, compiler = args.cxx)]
+            if flag_supported(flag = w, compiler = args.cxx)]
 
 warnings = ' '.join(warnings + ['-Wno-error=deprecated-declarations'])
+
+optimization_flags = [
+    '--param inline-unit-growth=300',
+]
+optimization_flags = [o
+                      for o in optimization_flags
+                      if flag_supported(flag = o, compiler = args.cxx)]
+modes['release']['opt'] += ' ' + ' '.join(optimization_flags)
+
+gold_linker_flag = gold_supported(compiler = args.cxx)
 
 dbgflag = debug_flag(args.cxx) if args.debuginfo else ''
 tests_link_rule = 'link' if args.tests_debuginfo else 'link_stripped'
@@ -790,12 +880,20 @@ if args.staticcxx:
     seastar_flags += ['--static-stdc++']
 if args.staticboost:
     seastar_flags += ['--static-boost']
+if args.staticyamlcpp:
+    seastar_flags += ['--static-yaml-cpp']
 if args.gcc6_concepts:
     seastar_flags += ['--enable-gcc6-concepts']
+if args.alloc_failure_injector:
+    seastar_flags += ['--enable-alloc-failure-injector']
 
-seastar_cflags = args.user_cflags + " -march=nehalem"
+seastar_cflags = args.user_cflags
+if args.target != '':
+    seastar_cflags += ' -march=' + args.target
 seastar_ldflags = args.user_ldflags
-seastar_flags += ['--compiler', args.cxx, '--c-compiler', args.cc, '--cflags=%s' % (seastar_cflags), '--ldflags=%s' %(seastar_ldflags)]
+seastar_flags += ['--compiler', args.cxx, '--c-compiler', args.cc, '--cflags=%s' % (seastar_cflags), '--ldflags=%s' %(seastar_ldflags),
+                  '--c++-dialect=gnu++1z', '--optflags=%s' % (modes['release']['opt']),
+                 ]
 
 status = subprocess.call([python, './configure.py'] + seastar_flags, cwd = 'seastar')
 
@@ -826,10 +924,15 @@ for mode in build_modes:
 seastar_deps = 'practically_anything_can_change_so_lets_run_it_every_time_and_restat.'
 
 args.user_cflags += " " + pkg_config("--cflags", "jsoncpp")
-libs = ' '.join(['-lyaml-cpp', '-llz4', '-lz', '-lsnappy', pkg_config("--libs", "jsoncpp"),
-                 maybe_static(args.staticboost, '-lboost_filesystem'), ' -lcrypt',
+libs = ' '.join([maybe_static(args.staticyamlcpp, '-lyaml-cpp'), '-llz4', '-lz', '-lsnappy', pkg_config("--libs", "jsoncpp"),
+                 maybe_static(args.staticboost, '-lboost_filesystem'), ' -lcrypt', ' -lcryptopp',
                  maybe_static(args.staticboost, '-lboost_date_time'),
                 ])
+
+xxhash_dir = 'xxHash'
+
+if not os.path.exists(xxhash_dir) or not os.listdir(xxhash_dir):
+    raise Exception(xxhash_dir + ' is empty. Run "git submodule update --init".')
 
 if not args.staticboost:
     args.user_cflags += ' -DBOOST_TEST_DYN_LINK'
@@ -853,13 +956,14 @@ os.makedirs(outdir, exist_ok = True)
 do_sanitize = True
 if args.static:
     do_sanitize = False
+
 with open(buildfile, 'w') as f:
     f.write(textwrap.dedent('''\
         configure_args = {configure_args}
         builddir = {outdir}
         cxx = {cxx}
         cxxflags = {user_cflags} {warnings} {defines}
-        ldflags = -fuse-ld=gold {user_ldflags}
+        ldflags = {gold_linker_flag} {user_ldflags}
         libs = {libs}
         pool link_pool
             depth = {link_pool_depth}
@@ -888,7 +992,7 @@ with open(buildfile, 'w') as f:
     for mode in build_modes:
         modeval = modes[mode]
         f.write(textwrap.dedent('''\
-            cxxflags_{mode} = -I. -I $builddir/{mode}/gen -I seastar -I seastar/build/{mode}/gen
+            cxxflags_{mode} = {opt} -DXXH_PRIVATE_API -I. -I $builddir/{mode}/gen -I seastar -I seastar/build/{mode}/gen
             rule cxx.{mode}
               command = $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags $cxxflags_{mode} $obj_cxxflags -c -o $out $in
               description = CXX $out
@@ -936,6 +1040,7 @@ with open(buildfile, 'w') as f:
             objs = ['$builddir/' + mode + '/' + src.replace('.cc', '.o')
                     for src in srcs
                     if src.endswith('.cc')]
+            objs.append('$builddir/../utils/arch/powerpc/crc32-vpmsum/crc32.S')
             has_thrift = False
             for dep in deps[binary]:
                 if isinstance(dep, Thrift):
@@ -1039,7 +1144,7 @@ with open(buildfile, 'w') as f:
         rule configure
           command = {python} configure.py $configure_args
           generator = 1
-        build build.ninja: configure | configure.py
+        build build.ninja: configure | configure.py seastar/configure.py
         rule cscope
             command = find -name '*.[chS]' -o -name "*.cc" -o -name "*.hh" | cscope -bq -i-
             description = CSCOPE

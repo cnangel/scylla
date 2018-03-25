@@ -34,8 +34,8 @@ logging::logger startlog("init");
 // duplicated in cql_test_env.cc
 // until proper shutdown is done.
 
-void init_storage_service(distributed<database>& db) {
-    service::init_storage_service(db).get();
+void init_storage_service(distributed<database>& db, sharded<auth::service>& auth_service) {
+    service::init_storage_service(db, auth_service).get();
     // #293 - do not stop anything
     //engine().at_exit([] { return service::deinit_storage_service(); });
 }
@@ -150,5 +150,33 @@ void init_ms_fd_gossiper(sstring listen_address_in
     //engine().at_exit([]{ return gms::get_gossiper().stop(); });
     gms::get_gossiper().invoke_on_all([cluster_name](gms::gossiper& g) {
         g.set_cluster_name(cluster_name);
+    });
+}
+
+
+std::vector<std::reference_wrapper<configurable>>& configurable::configurables() {
+    static std::vector<std::reference_wrapper<configurable>> configurables;
+    return configurables;
+}
+
+void configurable::register_configurable(configurable & c) {
+    configurables().emplace_back(std::ref(c));
+}
+
+void configurable::append_all(boost::program_options::options_description_easy_init& init) {
+    for (configurable& c : configurables()) {
+        c.append_options(init);
+    }
+}
+
+future<> configurable::init_all(const boost::program_options::variables_map& opts, const db::config& cfg, db::extensions& exts) {
+    return do_for_each(configurables(), [&](configurable& c) {
+        return c.initialize(opts, cfg, exts);
+    });
+}
+
+future<> configurable::init_all(const db::config& cfg, db::extensions& exts) {
+    return do_with(boost::program_options::variables_map{}, [&](auto& opts) {
+        return init_all(opts, cfg, exts);
     });
 }

@@ -50,6 +50,7 @@
 #include "gms/endpoint_state.hh"
 #include "gms/feature.hh"
 #include "utils/loading_shared_values.hh"
+#include "utils/in.hh"
 #include "message/messaging_service_fwd.hh"
 #include <boost/algorithm/string.hpp>
 #include <experimental/optional>
@@ -68,6 +69,9 @@ class gossip_digest;
 class inet_address;
 class i_endpoint_state_change_subscriber;
 class i_failure_detector;
+
+struct bind_messaging_port_tag {};
+using bind_messaging_port = bool_class<bind_messaging_port_tag>;
 
 /**
  * This module is responsible for Gossiping information for the local endpoint. This abstraction
@@ -91,7 +95,7 @@ private:
     netw::messaging_service& ms() {
         return netw::get_local_messaging_service();
     }
-    void init_messaging_service_handler();
+    void init_messaging_service_handler(bind_messaging_port do_bind = bind_messaging_port::yes);
     void uninit_messaging_service_handler();
     future<> handle_syn_msg(msg_addr from, gossip_digest_syn syn_msg);
     future<> handle_ack_msg(msg_addr from, gossip_digest_ack ack_msg);
@@ -480,12 +484,14 @@ public:
                          std::map<inet_address, endpoint_state>& delta_ep_state_map);
 
 public:
-    future<> start_gossiping(int generation_number);
+    future<> start_gossiping(int generation_number,
+            bind_messaging_port do_bind = bind_messaging_port::yes);
 
     /**
      * Start the gossiper with the generation number, preloading the map of application states before starting
      */
-    future<> start_gossiping(int generation_nbr, std::map<application_state, versioned_value> preload_local_states);
+    future<> start_gossiping(int generation_nbr, std::map<application_state, versioned_value> preload_local_states,
+            bind_messaging_port do_bind = bind_messaging_port::yes);
 
 public:
     /**
@@ -507,6 +513,17 @@ public:
     void add_saved_endpoint(inet_address ep);
 
     future<> add_local_application_state(application_state state, versioned_value value);
+
+    /**
+     * Applies all states in set "atomically", as in guaranteed monotonic versions and
+     * inserted into endpoint state together (and assuming same grouping, overwritten together).
+     */
+    future<> add_local_application_state(std::vector<std::pair<application_state, versioned_value>>);
+
+    /**
+     * Intentionally overenginered to avoid very rare string copies.
+     */
+    future<> add_local_application_state(std::initializer_list<std::pair<application_state, utils::in<versioned_value>>>);
 
     // Needed by seastar::sharded
     future<> stop();
@@ -540,10 +557,16 @@ public:
     sstring get_gossip_status(const inet_address& endpoint) const;
 public:
     future<> wait_for_gossip_to_settle();
+    future<> wait_for_range_setup();
 private:
+    future<> wait_for_gossip(std::chrono::milliseconds, stdx::optional<int32_t> = {});
+
     uint64_t _nr_run = 0;
+    uint64_t _msg_processing = 0;
     bool _ms_registered = false;
     bool _gossiped_to_seed = false;
+
+    class msg_proc_guard;
 private:
     condition_variable _features_condvar;
     std::unordered_map<sstring, std::vector<feature*>> _registered_features;

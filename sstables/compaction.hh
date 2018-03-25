@@ -24,6 +24,8 @@
 
 #include "database_fwd.hh"
 #include "shared_sstable.hh"
+#include "gc_clock.hh"
+#include "compaction_weight_registration.hh"
 #include <seastar/core/thread.hh>
 #include <functional>
 
@@ -36,10 +38,12 @@ namespace sstables {
         int level;
         // Threshold size for sstable(s) to be created.
         uint64_t max_sstable_bytes;
+        // Holds ownership of a weight assigned to this compaction iff it's a regular one.
+        stdx::optional<compaction_weight_registration> weight_registration;
 
         compaction_descriptor() = default;
 
-        compaction_descriptor(std::vector<sstables::shared_sstable> sstables, int level = 0, uint64_t max_sstable_bytes = std::numeric_limits<uint64_t>::max())
+        explicit compaction_descriptor(std::vector<sstables::shared_sstable> sstables, int level = 0, uint64_t max_sstable_bytes = std::numeric_limits<uint64_t>::max())
             : sstables(std::move(sstables))
             , level(level)
             , max_sstable_bytes(max_sstable_bytes) {}
@@ -92,6 +96,7 @@ namespace sstables {
         int64_t ended_at;
         std::vector<shared_sstable> new_sstables;
         sstring stop_requested;
+        bool tracking = true;
 
         bool is_stop_requested() const {
             return stop_requested.size() > 0;
@@ -99,6 +104,10 @@ namespace sstables {
 
         void stop(sstring reason) {
             stop_requested = std::move(reason);
+        }
+
+        void stop_tracking() {
+            tracking = false;
         }
     };
 
@@ -113,27 +122,20 @@ namespace sstables {
     // If cleanup is true, mutation that doesn't belong to current node will be
     // cleaned up, log messages will inform the user that compact_sstables runs for
     // cleaning operation, and compaction history will not be updated.
-    future<compaction_info> compact_sstables(std::vector<shared_sstable> sstables,
-            column_family& cf, std::function<shared_sstable()> creator,
-            uint64_t max_sstable_size, uint32_t sstable_level, bool cleanup = false,
-            seastar::thread_scheduling_group* tsg = nullptr);
+    future<compaction_info> compact_sstables(sstables::compaction_descriptor descriptor,
+            column_family& cf, std::function<shared_sstable()> creator, bool cleanup = false);
 
     // Compacts a set of N shared sstables into M sstables. For every shard involved,
     // i.e. which owns any of the sstables, a new unshared sstable is created.
     future<std::vector<shared_sstable>> reshard_sstables(std::vector<shared_sstable> sstables,
             column_family& cf, std::function<shared_sstable(shard_id)> creator,
-        uint64_t max_sstable_size, uint32_t sstable_level,
-        seastar::thread_scheduling_group* tsg = nullptr);
-
-    // Return the most interesting bucket applying the size-tiered strategy.
-    std::vector<sstables::shared_sstable>
-    size_tiered_most_interesting_bucket(const std::vector<sstables::shared_sstable>& candidates);
+        uint64_t max_sstable_size, uint32_t sstable_level);
 
     // Return list of expired sstables for column family cf.
     // A sstable is fully expired *iff* its max_local_deletion_time precedes gc_before and its
     // max timestamp is lower than any other relevant sstable.
     // In simpler words, a sstable is fully expired if all of its live cells with TTL is expired
     // and possibly doesn't contain any tombstone that covers cells in other sstables.
-    std::vector<sstables::shared_sstable>
-    get_fully_expired_sstables(column_family& cf, std::vector<sstables::shared_sstable>& compacting, int32_t gc_before);
+    std::unordered_set<sstables::shared_sstable>
+    get_fully_expired_sstables(column_family& cf, const std::vector<sstables::shared_sstable>& compacting, gc_clock::time_point gc_before);
 }

@@ -41,6 +41,7 @@
 
 #pragma once
 
+#include "utils/big_decimal.hh"
 #include "aggregate_function.hh"
 #include "native_aggregate_function.hh"
 
@@ -66,6 +67,19 @@ public:
     }
 };
 
+static const sstring COUNT_ROWS_FUNCTION_NAME = "countRows";
+
+class count_rows_function final : public native_aggregate_function {
+public:
+    count_rows_function() : native_aggregate_function(COUNT_ROWS_FUNCTION_NAME, long_type, {}) {}
+    virtual std::unique_ptr<aggregate> new_aggregate() override {
+        return std::make_unique<impl_count_function>();
+    }
+    virtual sstring column_name(const std::vector<sstring>& column_names) override {
+        return "count";
+    }
+};
+
     /**
      * The function used to count the number of rows of a result set. This function is called when COUNT(*) or COUNT(1)
      * is specified.
@@ -73,7 +87,7 @@ public:
 inline
 shared_ptr<aggregate_function>
 make_count_rows_function() {
-    return make_native_aggregate_function_using<impl_count_function>("countRows", long_type);
+    return make_shared<count_rows_function>();
 }
 
 template <typename Type>
@@ -112,8 +126,69 @@ make_sum_function() {
 }
 
 template <typename Type>
+class impl_div_for_avg {
+public:
+    static Type div(const Type& x, const int64_t y) {
+        return x/y;
+    }
+};
+
+template <>
+class impl_div_for_avg<big_decimal> {
+public:
+    static big_decimal div(const big_decimal& x, const int64_t y) {
+        return x.div(y, big_decimal::rounding_mode::HALF_EVEN);
+    }
+};
+
+// We need a wider accumulator for average, since summing the inputs can overflow
+// the input type
+template <typename T>
+struct accumulator_for;
+
+template <>
+struct accumulator_for<int8_t> {
+    using type = __int128;
+};
+
+template <>
+struct accumulator_for<int16_t> {
+    using type = __int128;
+};
+
+template <>
+struct accumulator_for<int32_t> {
+    using type = __int128;
+};
+
+template <>
+struct accumulator_for<int64_t> {
+    using type = __int128;
+};
+
+template <>
+struct accumulator_for<float> {
+    using type = float;
+};
+
+template <>
+struct accumulator_for<double> {
+    using type = double;
+};
+
+template <>
+struct accumulator_for<boost::multiprecision::cpp_int> {
+    using type = boost::multiprecision::cpp_int;
+};
+
+template <>
+struct accumulator_for<big_decimal> {
+    using type = big_decimal;
+};
+
+template <typename Type>
 class impl_avg_function_for final : public aggregate_function::aggregate {
-   Type _sum{};
+   typename accumulator_for<Type>::type _sum{};
    int64_t _count = 0;
 public:
     virtual void reset() override {
@@ -121,9 +196,9 @@ public:
         _count = 0;
     }
     virtual opt_bytes compute(cql_serialization_format sf) override {
-        Type ret = 0;
+        Type ret{};
         if (_count) {
-            ret = _sum / _count;
+            ret = impl_div_for_avg<Type>::div(_sum, _count);
         }
         return data_type_for<Type>()->decompose(ret);
     }
@@ -152,9 +227,29 @@ make_avg_function() {
     return make_shared<avg_function_for<Type>>();
 }
 
+template <typename T>
+struct aggregate_type_for {
+    using type = T;
+};
+
+template<>
+struct aggregate_type_for<simple_date_native_type> {
+    using type = simple_date_native_type::primary_type;
+};
+
+template<>
+struct aggregate_type_for<timestamp_native_type> {
+    using type = timestamp_native_type::primary_type;
+};
+
+template<>
+struct aggregate_type_for<timeuuid_native_type> {
+    using type = timeuuid_native_type::primary_type;
+};
+
 template <typename Type>
 class impl_max_function_for final : public aggregate_function::aggregate {
-   std::experimental::optional<Type> _max{};
+   std::experimental::optional<typename aggregate_type_for<Type>::type> _max{};
 public:
     virtual void reset() override {
         _max = {};
@@ -163,13 +258,13 @@ public:
         if (!_max) {
             return {};
         }
-        return data_type_for<Type>()->decompose(*_max);
+        return data_type_for<Type>()->decompose(Type{*_max});
     }
     virtual void add_input(cql_serialization_format sf, const std::vector<opt_bytes>& values) override {
         if (!values[0]) {
             return;
         }
-        auto val = value_cast<Type>(data_type_for<Type>()->deserialize(*values[0]));
+        auto val = value_cast<typename aggregate_type_for<Type>::type>(data_type_for<Type>()->deserialize(*values[0]));
         if (!_max) {
             _max = val;
         } else {
@@ -201,7 +296,7 @@ make_max_function() {
 
 template <typename Type>
 class impl_min_function_for final : public aggregate_function::aggregate {
-   std::experimental::optional<Type> _min{};
+   std::experimental::optional<typename aggregate_type_for<Type>::type> _min{};
 public:
     virtual void reset() override {
         _min = {};
@@ -210,13 +305,13 @@ public:
         if (!_min) {
             return {};
         }
-        return data_type_for<Type>()->decompose(*_min);
+        return data_type_for<Type>()->decompose(Type{*_min});
     }
     virtual void add_input(cql_serialization_format sf, const std::vector<opt_bytes>& values) override {
         if (!values[0]) {
             return;
         }
-        auto val = value_cast<Type>(data_type_for<Type>()->deserialize(*values[0]));
+        auto val = value_cast<typename aggregate_type_for<Type>::type>(data_type_for<Type>()->deserialize(*values[0]));
         if (!_min) {
             _min = val;
         } else {

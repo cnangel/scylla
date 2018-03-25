@@ -30,13 +30,9 @@
 #include "core/thread.hh"
 #include "memtable.hh"
 #include "mutation_source_test.hh"
-#include "mutation_reader_assertions.hh"
 #include "mutation_assertions.hh"
-
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
+#include "flat_mutation_reader_assertions.hh"
+#include "flat_mutation_reader.hh"
 
 static api::timestamp_type next_timestamp() {
     static thread_local api::timestamp_type next_timestamp = 1;
@@ -55,7 +51,7 @@ static void set_column(mutation& m, const sstring& column_name) {
 
 static
 mutation make_unique_mutation(schema_ptr s) {
-    return mutation(partition_key::from_single_value(*s, make_unique_bytes()), s);
+    return mutation(s, partition_key::from_single_value(*s, make_unique_bytes()));
 }
 
 // Returns a vector of empty mutations in ring order
@@ -84,6 +80,90 @@ SEASTAR_TEST_CASE(test_memtable_conforms_to_mutation_source) {
     });
 }
 
+SEASTAR_TEST_CASE(test_memtable_with_many_versions_conforms_to_mutation_source) {
+    return seastar::async([] {
+        lw_shared_ptr<memtable> mt;
+        std::vector<flat_mutation_reader> readers;
+        run_mutation_source_tests([&] (schema_ptr s, const std::vector<mutation>& muts) {
+            readers.clear();
+            mt = make_lw_shared<memtable>(s);
+
+            for (auto&& m : muts) {
+                mt->apply(m);
+                // Create reader so that each mutation is in a separate version
+                flat_mutation_reader rd = mt->make_flat_reader(s, dht::partition_range::make_singular(m.decorated_key()));
+                rd.set_max_buffer_size(1);
+                rd.fill_buffer().get();
+                readers.push_back(std::move(rd));
+            }
+
+            return mt->as_data_source();
+        });
+    });
+}
+
+SEASTAR_TEST_CASE(test_memtable_flush_reader) {
+    // Memtable flush reader is severly limited, it always assumes that
+    // the full partition range is being read and that
+    // streamed_mutation::forwarding is set to no. Therefore, we cannot use
+    // run_mutation_source_tests() to test it.
+    return seastar::async([] {
+        auto make_memtable = [] (dirty_memory_manager& mgr, std::vector<mutation> muts) {
+            assert(!muts.empty());
+            auto mt = make_lw_shared<memtable>(muts.front().schema(), mgr);
+            for (auto& m : muts) {
+                mt->apply(m);
+            }
+            return mt;
+        };
+
+        auto test_random_streams = [&] (random_mutation_generator&& gen) {
+            for (auto i = 0; i < 4; i++) {
+                dirty_memory_manager mgr;
+                auto muts = gen(4);
+
+                BOOST_TEST_MESSAGE("Simple read");
+                auto mt = make_memtable(mgr, muts);
+                assert_that(mt->make_flush_reader(gen.schema(), default_priority_class()))
+                    .produces_partition(muts[0])
+                    .produces_partition(muts[1])
+                    .produces_partition(muts[2])
+                    .produces_partition(muts[3])
+                    .produces_end_of_stream();
+
+                BOOST_TEST_MESSAGE("Read with next_partition() calls between partition");
+                mt = make_memtable(mgr, muts);
+                assert_that(mt->make_flush_reader(gen.schema(), default_priority_class()))
+                    .next_partition()
+                    .produces_partition(muts[0])
+                    .next_partition()
+                    .produces_partition(muts[1])
+                    .next_partition()
+                    .produces_partition(muts[2])
+                    .next_partition()
+                    .produces_partition(muts[3])
+                    .next_partition()
+                    .produces_end_of_stream();
+
+                BOOST_TEST_MESSAGE("Read with next_partition() calls inside partitions");
+                mt = make_memtable(mgr, muts);
+                assert_that(mt->make_flush_reader(gen.schema(), default_priority_class()))
+                    .produces_partition(muts[0])
+                    .produces_partition_start(muts[1].decorated_key(), muts[1].partition().partition_tombstone())
+                    .next_partition()
+                    .produces_partition(muts[2])
+                    .next_partition()
+                    .produces_partition_start(muts[3].decorated_key(), muts[3].partition().partition_tombstone())
+                    .next_partition()
+                    .produces_end_of_stream();
+            }
+        };
+
+        test_random_streams(random_mutation_generator(random_mutation_generator::generate_counters::no));
+        test_random_streams(random_mutation_generator(random_mutation_generator::generate_counters::yes));
+    });
+}
+
 SEASTAR_TEST_CASE(test_adding_a_column_during_reading_doesnt_affect_read_result) {
     return seastar::async([] {
         auto common_builder = schema_builder("ks", "cf")
@@ -107,8 +187,8 @@ SEASTAR_TEST_CASE(test_adding_a_column_during_reading_doesnt_affect_read_result)
             mt->apply(m);
         }
 
-        auto check_rd_s1 = assert_that(mt->make_reader(s1));
-        auto check_rd_s2 = assert_that(mt->make_reader(s2));
+        auto check_rd_s1 = assert_that(mt->make_flat_reader(s1));
+        auto check_rd_s2 = assert_that(mt->make_flat_reader(s2));
         check_rd_s1.next_mutation().has_schema(s1).is_equal_to(ring[0]);
         check_rd_s2.next_mutation().has_schema(s2).is_equal_to(ring[0]);
         mt->set_schema(s2);
@@ -119,13 +199,13 @@ SEASTAR_TEST_CASE(test_adding_a_column_during_reading_doesnt_affect_read_result)
         check_rd_s1.produces_end_of_stream();
         check_rd_s2.produces_end_of_stream();
 
-        assert_that(mt->make_reader(s1))
+        assert_that(mt->make_flat_reader(s1))
             .produces(ring[0])
             .produces(ring[1])
             .produces(ring[2])
             .produces_end_of_stream();
 
-        assert_that(mt->make_reader(s2))
+        assert_that(mt->make_flat_reader(s2))
             .produces(ring[0])
             .produces(ring[1])
             .produces(ring[2])
@@ -156,8 +236,9 @@ SEASTAR_TEST_CASE(test_virtual_dirty_accounting_on_flush) {
         }
 
         // Create a reader which will cause many partition versions to be created
-        auto rd1 = mt->make_reader(s);
-        streamed_mutation_opt part0_stream = rd1().get0();
+        flat_mutation_reader_opt rd1 = mt->make_flat_reader(s);
+        rd1->set_max_buffer_size(1);
+        rd1->fill_buffer().get();
 
         // Override large cell value with a short one
         {
@@ -172,18 +253,17 @@ SEASTAR_TEST_CASE(test_virtual_dirty_accounting_on_flush) {
         virtual_dirty_values.push_back(mgr.virtual_dirty_memory());
 
         auto flush_reader_check = assert_that(mt->make_flush_reader(s, service::get_local_priority_manager().memtable_flush_priority()));
-        flush_reader_check.produces(current_ring[0]);
+        flush_reader_check.produces_partition(current_ring[0]);
         virtual_dirty_values.push_back(mgr.virtual_dirty_memory());
-        flush_reader_check.produces(current_ring[1]);
+        flush_reader_check.produces_partition(current_ring[1]);
         virtual_dirty_values.push_back(mgr.virtual_dirty_memory());
 
-        part0_stream = {};
-
-        while (rd1().get0()) ;
+        while ((*rd1)().get0()) ;
+        rd1 = {};
 
         logalloc::shard_tracker().full_compaction();
 
-        flush_reader_check.produces(current_ring[2]);
+        flush_reader_check.produces_partition(current_ring[2]);
         virtual_dirty_values.push_back(mgr.virtual_dirty_memory());
         flush_reader_check.produces_end_of_stream();
         virtual_dirty_values.push_back(mgr.virtual_dirty_memory());
@@ -219,55 +299,46 @@ SEASTAR_TEST_CASE(test_partition_version_consistency_after_lsa_compaction_happen
         m3.set_clustered_cell(ck3, to_bytes("col"), data_value(bytes(bytes::initialized_later(), 8)), next_timestamp());
 
         mt->apply(m1);
-        auto rd1 = mt->make_reader(s);
-        streamed_mutation_opt stream1 = rd1().get0();
+        stdx::optional<flat_reader_assertions> rd1 = assert_that(mt->make_flat_reader(s));
+        rd1->set_max_buffer_size(1);
+        rd1->fill_buffer().get();
 
         mt->apply(m2);
-        auto rd2 = mt->make_reader(s);
-        streamed_mutation_opt stream2 = rd2().get0();
+        stdx::optional<flat_reader_assertions> rd2 = assert_that(mt->make_flat_reader(s));
+        rd2->set_max_buffer_size(1);
+        rd2->fill_buffer().get();
 
         mt->apply(m3);
-        auto rd3 = mt->make_reader(s);
-        streamed_mutation_opt stream3 = rd3().get0();
+        stdx::optional<flat_reader_assertions> rd3 = assert_that(mt->make_flat_reader(s));
+        rd3->set_max_buffer_size(1);
+        rd3->fill_buffer().get();
 
         logalloc::shard_tracker().full_compaction();
 
-        auto rd4 = mt->make_reader(s);
-        streamed_mutation_opt stream4 = rd4().get0();
-        auto rd5 = mt->make_reader(s);
-        streamed_mutation_opt stream5 = rd5().get0();
-        auto rd6 = mt->make_reader(s);
-        streamed_mutation_opt stream6 = rd6().get0();
+        auto rd4 = assert_that(mt->make_flat_reader(s));
+        rd4.set_max_buffer_size(1);
+        rd4.fill_buffer().get();
+        auto rd5 = assert_that(mt->make_flat_reader(s));
+        rd5.set_max_buffer_size(1);
+        rd5.fill_buffer().get();
+        auto rd6 = assert_that(mt->make_flat_reader(s));
+        rd6.set_max_buffer_size(1);
+        rd6.fill_buffer().get();
 
-        assert_that(mutation_from_streamed_mutation(std::move(stream1)).get0()).has_mutation().is_equal_to(m1);
-        assert_that(mutation_from_streamed_mutation(std::move(stream2)).get0()).has_mutation().is_equal_to(m1 + m2);
-        assert_that(mutation_from_streamed_mutation(std::move(stream3)).get0()).has_mutation().is_equal_to(m1 + m2 + m3);
-
+        rd1->next_mutation().is_equal_to(m1);
+        rd2->next_mutation().is_equal_to(m1 + m2);
+        rd3->next_mutation().is_equal_to(m1 + m2 + m3);
         rd3 = {};
 
-        assert_that(mutation_from_streamed_mutation(std::move(stream4)).get0()).has_mutation().is_equal_to(m1 + m2 + m3);
-
+        rd4.next_mutation().is_equal_to(m1 + m2 + m3);
         rd1 = {};
 
-        assert_that(mutation_from_streamed_mutation(std::move(stream5)).get0()).has_mutation().is_equal_to(m1 + m2 + m3);
-
+        rd5.next_mutation().is_equal_to(m1 + m2 + m3);
         rd2 = {};
 
-        assert_that(mutation_from_streamed_mutation(std::move(stream6)).get0()).has_mutation().is_equal_to(m1 + m2 + m3);
+        rd6.next_mutation().is_equal_to(m1 + m2 + m3);
     });
 }
-
-struct function_invoking_consumer {
-    std::function<void()> func;
-
-    template<typename T>
-    stop_iteration consume(T t) {
-        func();
-        return stop_iteration::no;
-    }
-
-    void consume_end_of_stream() { }
-};
 
 // Reproducer for #1746
 SEASTAR_TEST_CASE(test_segment_migration_during_flush) {
@@ -300,15 +371,14 @@ SEASTAR_TEST_CASE(test_segment_migration_during_flush) {
 
         auto rd = mt->make_flush_reader(s, service::get_local_priority_manager().memtable_flush_priority());
 
-        auto consume_mutation = [] (streamed_mutation_opt part) {
-            assert(part);
-            consume(*part, function_invoking_consumer{[] {
-                logalloc::shard_tracker().full_compaction();
-            }}).get();
-        };
-
         for (int i = 0; i < partitions; ++i) {
-            consume_mutation(rd().get0());
+            auto mfopt = rd().get0();
+            BOOST_REQUIRE(bool(mfopt));
+            BOOST_REQUIRE(mfopt->is_partition_start());
+            while (!mfopt->is_end_of_partition()) {
+                logalloc::shard_tracker().full_compaction();
+                mfopt = rd().get0();
+            }
             virtual_dirty_values.push_back(mgr.virtual_dirty_memory());
         }
 
@@ -337,24 +407,155 @@ SEASTAR_TEST_CASE(test_fast_forward_to_after_memtable_is_flushed) {
             mt2->apply(m);
         }
 
-        auto rd = mt->make_reader(s);
-
-        auto sm_opt = rd().get0();
-        BOOST_REQUIRE(sm_opt);
-        BOOST_REQUIRE(sm_opt->key().equal(*s, ring[0].key()));
+        auto rd = assert_that(mt->make_flat_reader(s));
+        rd.produces(ring[0]);
         mt->mark_flushed(mt2->as_data_source());
-        sm_opt = rd().get0();
-        BOOST_REQUIRE(sm_opt);
-        BOOST_REQUIRE(sm_opt->key().equal(*s, ring[1].key()));
-
+        rd.produces(ring[1]);
         auto range = dht::partition_range::make_starting_with(dht::ring_position(ring[3].decorated_key()));
         rd.fast_forward_to(range);
-        sm_opt = rd().get0();
-        BOOST_REQUIRE(sm_opt);
-        BOOST_REQUIRE(sm_opt->key().equal(*s, ring[3].key()));
-        sm_opt = rd().get0();
-        BOOST_REQUIRE(sm_opt);
-        BOOST_REQUIRE(sm_opt->key().equal(*s, ring[4].key()));
-        BOOST_REQUIRE(!rd().get0());
+        rd.produces(ring[3]).produces(ring[4]).produces_end_of_stream();
+    });
+}
+
+SEASTAR_TEST_CASE(test_exception_safety_of_partition_range_reads) {
+    return seastar::async([] {
+        random_mutation_generator gen(random_mutation_generator::generate_counters::no);
+        auto s = gen.schema();
+        std::vector<mutation> ms = gen(2);
+
+        auto mt = make_lw_shared<memtable>(s);
+        for (auto& m : ms) {
+            mt->apply(m);
+        }
+
+        auto& injector = memory::local_failure_injector();
+        uint64_t i = 0;
+        do {
+            try {
+                injector.fail_after(i++);
+                assert_that(mt->make_flat_reader(s, query::full_partition_range))
+                    .produces(ms);
+                injector.cancel();
+            } catch (const std::bad_alloc&) {
+                // expected
+            }
+        } while (injector.failed());
+    });
+}
+
+SEASTAR_TEST_CASE(test_exception_safety_of_flush_reads) {
+    return seastar::async([] {
+        random_mutation_generator gen(random_mutation_generator::generate_counters::no);
+        auto s = gen.schema();
+        std::vector<mutation> ms = gen(2);
+
+        auto mt = make_lw_shared<memtable>(s);
+        for (auto& m : ms) {
+            mt->apply(m);
+        }
+
+        auto& injector = memory::local_failure_injector();
+        uint64_t i = 0;
+        do {
+            try {
+                injector.fail_after(i++);
+                assert_that(mt->make_flush_reader(s, default_priority_class()))
+                    .produces(ms);
+                injector.cancel();
+            } catch (const std::bad_alloc&) {
+                // expected
+            }
+            mt->revert_flushed_memory();
+        } while (injector.failed());
+    });
+}
+
+SEASTAR_TEST_CASE(test_exception_safety_of_single_partition_reads) {
+    return seastar::async([] {
+        random_mutation_generator gen(random_mutation_generator::generate_counters::no);
+        auto s = gen.schema();
+        std::vector<mutation> ms = gen(2);
+
+        auto mt = make_lw_shared<memtable>(s);
+        for (auto& m : ms) {
+            mt->apply(m);
+        }
+
+        auto& injector = memory::local_failure_injector();
+        uint64_t i = 0;
+        do {
+            try {
+                injector.fail_after(i++);
+                assert_that(mt->make_flat_reader(s, dht::partition_range::make_singular(ms[1].decorated_key())))
+                    .produces(ms[1]);
+                injector.cancel();
+            } catch (const std::bad_alloc&) {
+                // expected
+            }
+        } while (injector.failed());
+    });
+}
+
+SEASTAR_TEST_CASE(test_hash_is_cached) {
+    return seastar::async([] {
+        auto s = schema_builder("ks", "cf")
+                .with_column("pk", bytes_type, column_kind::partition_key)
+                .with_column("v", bytes_type, column_kind::regular_column)
+                .build();
+
+        auto mt = make_lw_shared<memtable>(s);
+
+        auto m = make_unique_mutation(s);
+        set_column(m, "v");
+        mt->apply(m);
+
+        {
+            auto rd = mt->make_flat_reader(s);
+            rd().get0()->as_partition_start();
+            clustering_row row = rd().get0()->as_clustering_row();
+            BOOST_REQUIRE(!row.cells().cell_hash_for(0));
+        }
+
+        {
+            auto slice = s->full_slice();
+            slice.options.set<query::partition_slice::option::with_digest>();
+            auto rd = mt->make_flat_reader(s, query::full_partition_range, slice);
+            rd().get0()->as_partition_start();
+            clustering_row row = rd().get0()->as_clustering_row();
+            BOOST_REQUIRE(row.cells().cell_hash_for(0));
+        }
+
+        {
+            auto rd = mt->make_flat_reader(s);
+            rd().get0()->as_partition_start();
+            clustering_row row = rd().get0()->as_clustering_row();
+            BOOST_REQUIRE(row.cells().cell_hash_for(0));
+        }
+
+        set_column(m, "v");
+        mt->apply(m);
+
+        {
+            auto rd = mt->make_flat_reader(s);
+            rd().get0()->as_partition_start();
+            clustering_row row = rd().get0()->as_clustering_row();
+            BOOST_REQUIRE(!row.cells().cell_hash_for(0));
+        }
+
+        {
+            auto slice = s->full_slice();
+            slice.options.set<query::partition_slice::option::with_digest>();
+            auto rd = mt->make_flat_reader(s, query::full_partition_range, slice);
+            rd().get0()->as_partition_start();
+            clustering_row row = rd().get0()->as_clustering_row();
+            BOOST_REQUIRE(row.cells().cell_hash_for(0));
+        }
+
+        {
+            auto rd = mt->make_flat_reader(s);
+            rd().get0()->as_partition_start();
+            clustering_row row = rd().get0()->as_clustering_row();
+            BOOST_REQUIRE(row.cells().cell_hash_for(0));
+        }
     });
 }

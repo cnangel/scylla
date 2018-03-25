@@ -31,11 +31,6 @@
 #include "schema_builder.hh"
 #include "memtable.hh"
 
-#include "disk-error-handler.hh"
-
-thread_local disk_error_signal_type commit_error;
-thread_local disk_error_signal_type general_disk_error;
-
 static
 partition_key new_key(schema_ptr s) {
     static thread_local int next = 0;
@@ -81,13 +76,13 @@ int main(int argc, char** argv) {
             size_t large_cell_size = cell_size * row_count;
 
             auto make_small_mutation = [&] {
-                mutation m(new_key(s), s);
+                mutation m(s, new_key(s));
                 m.set_clustered_cell(new_ckey(s), "v", data_value(bytes(bytes::initialized_later(), cell_size)), 1);
                 return m;
             };
 
             auto make_large_mutation = [&] {
-                mutation m(new_key(s), s);
+                mutation m(s, new_key(s));
                 m.set_clustered_cell(new_ckey(s), "v", data_value(bytes(bytes::initialized_later(), large_cell_size)), 2);
                 return m;
             };
@@ -98,12 +93,12 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 10; i++) {
                 auto key = dht::global_partitioner().decorate_key(*s, new_key(s));
 
-                mutation m1(key, s);
+                mutation m1(s, key);
                 m1.set_clustered_cell(new_ckey(s), "v", data_value(bytes(bytes::initialized_later(), cell_size)), 1);
                 cache.populate(m1);
 
                 // Putting large mutations into the memtable. Should take about row_count*cell_size each.
-                mutation m2(key, s);
+                mutation m2(s, key);
                 for (size_t j = 0; j < row_count; j++) {
                     m2.set_clustered_cell(new_ckey(s), "v", data_value(bytes(bytes::initialized_later(), cell_size)), 2);
                 }
@@ -127,13 +122,13 @@ int main(int argc, char** argv) {
             std::deque<dht::decorated_key> cache_stuffing;
             auto fill_cache_to_the_top = [&] {
                 std::cout << "Filling up memory with evictable data\n";
+                // Ensure that entries matching memtable partitions are not evicted,
+                // we want to hit the merge path in row_cache::update()
+                for (auto&& key : keys) {
+                    cache.unlink_from_lru(key);
+                }
                 while (true) {
                     auto evictions_before = tracker.get_stats().partition_evictions;
-                    // Ensure that entries matching memtable partitions are evicted
-                    // last, we want to hit the merge path in row_cache::update()
-                    for (auto&& key : keys) {
-                        cache.touch(key);
-                    }
                     auto m = make_small_mutation();
                     cache_stuffing.push_back(m.decorated_key());
                     cache.populate(m);
@@ -190,7 +185,7 @@ int main(int argc, char** argv) {
             for (auto&& key : keys) {
                 auto range = dht::partition_range::make_singular(key);
                 auto reader = cache.make_reader(s, range);
-                auto mo = mutation_from_streamed_mutation(reader().get0()).get0();
+                auto mo = read_mutation_from_flat_mutation_reader(reader).get0();
                 assert(mo);
                 assert(mo->partition().live_row_count(*s) ==
                        row_count + 1 /* one row was already in cache before update()*/);
@@ -207,8 +202,9 @@ int main(int argc, char** argv) {
             for (auto&& key : keys) {
                 auto range = dht::partition_range::make_singular(key);
                 auto reader = cache.make_reader(s, range);
-                auto mo = reader().get0();
-                assert(mo);
+                auto mfopt = reader().get0();
+                assert(mfopt);
+                assert(mfopt->is_partition_start());
             }
 
             std::cout << "Testing reading when memory can't be reclaimed.\n";

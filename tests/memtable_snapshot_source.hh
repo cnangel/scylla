@@ -63,9 +63,9 @@ private:
         auto count = _memtables.size();
         auto op = _apply.start();
         auto new_mt = make_lw_shared<memtable>(_memtables.back()->schema());
-        std::vector<mutation_reader> readers;
+        std::vector<flat_mutation_reader> readers;
         for (auto&& mt : _memtables) {
-            readers.push_back(mt->make_reader(new_mt->schema(),
+            readers.push_back(mt->make_flat_reader(new_mt->schema(),
                  query::full_partition_range,
                  new_mt->schema()->full_slice(),
                  default_priority_class(),
@@ -73,8 +73,8 @@ private:
                  streamed_mutation::forwarding::no,
                  mutation_reader::forwarding::yes));
         }
-        auto&& rd = make_combined_reader(std::move(readers), mutation_reader::forwarding::yes);
-        consume(rd, [&] (mutation&& m) {
+        auto&& rd = make_combined_reader(new_mt->schema(), std::move(readers));
+        consume_partitions(rd, [&] (mutation&& m) {
             new_mt->apply(std::move(m));
             return stop_iteration::no;
         }).get();
@@ -84,10 +84,11 @@ private:
 public:
     memtable_snapshot_source(schema_ptr s)
         : _s(s)
-        , _compactor(seastar::async([this] {
+        , _compactor(seastar::async([this] () noexcept {
             while (!_closed) {
                 _should_compact.wait().get();
                 while (should_compact()) {
+                    memory::disable_failure_guard dfg;
                     compact();
                 }
             }

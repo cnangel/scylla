@@ -168,7 +168,7 @@ public:
      * @note The tracing session's "duration" is the time it was in the "foreground"
      * state.
      */
-    void stop_foreground_and_write();
+    void stop_foreground_and_write() noexcept;
 
     const utils::UUID& session_id() const {
         return _records->session_id;
@@ -373,9 +373,9 @@ private:
         _params_ptr->user_timestamp.emplace(val);
     }
 
-    void set_username(shared_ptr<auth::authenticated_user> user) {
+    void set_username(const stdx::optional<auth::authenticated_user>& user) {
         if (user) {
-            _records->session_rec.username = user->name();
+            _records->session_rec.username = sprint("%s", *user);
         }
     }
 
@@ -391,13 +391,33 @@ private:
     void build_parameters_map();
 
     /**
+     * The actual trace message storing method.
+     *
+     * @note This method is allowed to throw.
+     * @param msg the trace message to store
+     */
+    void trace_internal(sstring msg);
+
+    /**
      * Add a single trace entry - a special case for a simple string.
      *
      * @param msg trace message
      */
-    void trace(sstring msg);
-    void trace(const char* msg) {
-        trace(sstring(msg));
+    void trace(sstring msg) noexcept {
+        try {
+            trace_internal(std::move(msg));
+        } catch (...) {
+            // Bump up an error counter and ignore
+            ++_local_tracing_ptr->stats.trace_errors;
+        }
+    }
+    void trace(const char* msg) noexcept {
+        try {
+            trace_internal(sstring(msg));
+        } catch (...) {
+            // Bump up an error counter and ignore
+            ++_local_tracing_ptr->stats.trace_errors;
+        }
     }
 
     /**
@@ -416,13 +436,13 @@ private:
      * @param a positional parameters
      */
     template <typename... A>
-    void trace(const char* fmt, A&&... a);
+    void trace(const char* fmt, A&&... a) noexcept;
 
     template <typename... A>
     friend void begin(const trace_state_ptr& p, A&&... a);
 
     template <typename... A>
-    friend void trace(const trace_state_ptr& p, A&&... a);
+    friend void trace(const trace_state_ptr& p, A&&... a) noexcept;
 
     friend void set_page_size(const trace_state_ptr& p, int32_t val);
     friend void set_batchlog_endpoints(const trace_state_ptr& p, const std::unordered_set<gms::inet_address>& val);
@@ -430,11 +450,11 @@ private:
     friend void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::experimental::optional<db::consistency_level>&val);
     friend void set_query(const trace_state_ptr& p, const sstring& val);
     friend void set_user_timestamp(const trace_state_ptr& p, api::timestamp_type val);
-    friend void set_username(const trace_state_ptr& p, shared_ptr<auth::authenticated_user> user);
+    friend void set_username(const trace_state_ptr& p, const stdx::optional<auth::authenticated_user>& user);
     friend void add_table_name(const trace_state_ptr& p, const sstring& ks_name, const sstring& cf_name);
 };
 
-inline void trace_state::trace(sstring message) {
+inline void trace_state::trace_internal(sstring message) {
     if (is_in_state(state::inactive)) {
         throw std::logic_error("trying to use a trace() before begin() for \"" + message + "\" tracepoint");
     }
@@ -480,9 +500,9 @@ inline void trace_state::trace(sstring message) {
 }
 
 template <typename... A>
-void trace_state::trace(const char* fmt, A&&... a) {
+void trace_state::trace(const char* fmt, A&&... a) noexcept {
     try {
-        trace(seastar::format(fmt, std::forward<A>(a)...));
+        trace_internal(seastar::format(fmt, std::forward<A>(a)...));
     } catch (...) {
         // Bump up an error counter and ignore
         ++_local_tracing_ptr->stats.trace_errors;
@@ -534,7 +554,7 @@ inline void set_user_timestamp(const trace_state_ptr& p, api::timestamp_type val
     }
 }
 
-inline void set_username(const trace_state_ptr& p, shared_ptr<auth::authenticated_user> user) {
+inline void set_username(const trace_state_ptr& p, const stdx::optional<auth::authenticated_user>& user) {
     if (p) {
         p->set_username(user);
     }
@@ -589,7 +609,7 @@ inline void begin(const trace_state_ptr& p, A&&... a) {
  * @param a trace message format string with optional parameters
  */
 template <typename... A>
-inline void trace(const trace_state_ptr& p, A&&... a) {
+inline void trace(const trace_state_ptr& p, A&&... a) noexcept {
     if (p) {
         p->trace(std::forward<A>(a)...);
     }
@@ -610,7 +630,7 @@ inline std::experimental::optional<trace_info> make_trace_info(const trace_state
     return std::experimental::nullopt;
 }
 
-inline void stop_foreground(const trace_state_ptr& state) {
+inline void stop_foreground(const trace_state_ptr& state) noexcept {
     if (state) {
         state->stop_foreground_and_write();
     }

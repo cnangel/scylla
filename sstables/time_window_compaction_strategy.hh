@@ -43,6 +43,7 @@
 
 #include "compaction_strategy_impl.hh"
 #include "compaction.hh"
+#include "size_tiered_compaction_strategy.hh"
 #include "timestamp.hh"
 #include "exceptions/exceptions.hh"
 #include <boost/range/algorithm/partial_sort.hpp>
@@ -119,19 +120,10 @@ class time_window_compaction_strategy : public compaction_strategy_impl {
     int64_t _estimated_remaining_tasks = 0;
     db_clock::time_point _last_expired_check;
     timestamp_type _highest_window_seen;
+    size_tiered_compaction_strategy_options _stcs_options;
+    compaction_backlog_tracker _backlog_tracker;
 public:
-    time_window_compaction_strategy(const std::map<sstring, sstring>& options)
-        : compaction_strategy_impl(options), _options(options)
-    {
-        if (!options.count(TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.count(TOMBSTONE_THRESHOLD_OPTION)) {
-            _disable_tombstone_compaction = true;
-            clogger.debug("Disabling tombstone compactions for TWCS");
-        } else {
-            clogger.debug("Enabling tombstone compactions for TWCS");
-        }
-        _use_clustering_key_filter = true;
-    }
-
+    time_window_compaction_strategy(const std::map<sstring, sstring>& options);
     virtual compaction_descriptor get_sstables_for_compaction(column_family& cf, std::vector<shared_sstable> candidates) override {
         auto gc_before = gc_clock::now() - cf.schema()->gc_grace_seconds();
 
@@ -140,19 +132,18 @@ public:
         }
 
         // Find fully expired SSTables. Those will be included no matter what.
-        std::vector<shared_sstable> expired;
+        std::unordered_set<shared_sstable> expired;
 
         if (db_clock::now() - _last_expired_check > _options.expired_sstable_check_frequency) {
             clogger.debug("TWCS expired check sufficiently far in the past, checking for fully expired SSTables");
-            expired = get_fully_expired_sstables(cf, candidates, gc_before.time_since_epoch().count());
+            expired = get_fully_expired_sstables(cf, candidates, gc_before);
             _last_expired_check = db_clock::now();
         } else {
             clogger.debug("TWCS skipping check for fully expired SSTables");
         }
 
         if (!expired.empty()) {
-            auto expired_as_set = boost::copy_range<std::unordered_set<shared_sstable>>(expired);
-            auto is_expired = [&] (const shared_sstable& s) { return expired_as_set.find(s) != expired_as_set.end(); };
+            auto is_expired = [&] (const shared_sstable& s) { return expired.find(s) != expired.end(); };
             candidates.erase(boost::remove_if(candidates, is_expired), candidates.end());
         }
 
@@ -160,7 +151,7 @@ public:
         if (!expired.empty()) {
             compaction_candidates.insert(compaction_candidates.end(), expired.begin(), expired.end());
         }
-        return compaction_candidates;
+        return compaction_descriptor(std::move(compaction_candidates));
     }
 private:
     std::vector<shared_sstable>
@@ -194,7 +185,7 @@ private:
         update_estimated_compaction_by_tasks(p.first, cf.schema()->min_compaction_threshold());
 
         return newest_bucket(std::move(p.first), cf.schema()->min_compaction_threshold(), cf.schema()->max_compaction_threshold(),
-            _options.sstable_window_size, _highest_window_seen);
+            _options.sstable_window_size, _highest_window_seen, _stcs_options);
     }
 public:
     // Find the lowest timestamp for window of given size
@@ -232,7 +223,7 @@ public:
 
     static std::vector<shared_sstable>
     newest_bucket(std::map<timestamp_type, std::vector<shared_sstable>> buckets, int min_threshold, int max_threshold,
-            std::chrono::seconds sstable_window_size, timestamp_type now) {
+            std::chrono::seconds sstable_window_size, timestamp_type now, size_tiered_compaction_strategy_options& stcs_options) {
         // If the current bucket has at least minThreshold SSTables, choose that one.
         // For any other bucket, at least 2 SSTables is enough.
         // In any case, limit to maxThreshold SSTables.
@@ -245,7 +236,7 @@ public:
 
             if (bucket.size() >= size_t(min_threshold) && key >= now) {
                 // If we're in the newest bucket, we'll use STCS to prioritize sstables
-                auto stcs_interesting_bucket = size_tiered_most_interesting_bucket(bucket);
+                auto stcs_interesting_bucket = size_tiered_compaction_strategy::most_interesting_bucket(bucket, min_threshold, max_threshold, stcs_options);
 
                 // If the tables in the current bucket aren't eligible in the STCS strategy, we'll skip it and look for other buckets
                 if (!stcs_interesting_bucket.empty()) {
@@ -296,6 +287,10 @@ public:
 
     virtual compaction_strategy_type type() const {
         return compaction_strategy_type::time_window;
+    }
+
+    virtual compaction_backlog_tracker& get_backlog_tracker() override {
+        return _backlog_tracker;
     }
 };
 

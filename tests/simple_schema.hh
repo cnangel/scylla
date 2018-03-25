@@ -26,10 +26,10 @@
 #include "make_random_string.hh"
 #include "schema.hh"
 #include "keys.hh"
-#include "streamed_mutation.hh"
+#include "mutation_fragment.hh"
 #include "mutation.hh"
 #include "schema_builder.hh"
-#include "streamed_mutation.hh"
+#include "sstable_utils.hh"
 
 // Helper for working with the following table:
 //
@@ -47,11 +47,12 @@ public:
         return {new_timestamp(), gc_clock::now()};
     }
 public:
-    simple_schema()
+    using with_static = bool_class<class static_tag>;
+    simple_schema(with_static ws = with_static::yes)
         : _s(schema_builder("ks", "cf")
             .with_column("pk", utf8_type, column_kind::partition_key)
             .with_column("ck", utf8_type, column_kind::clustering_key)
-            .with_column("s1", utf8_type, column_kind::static_column)
+            .with_column("s1", utf8_type, ws ? column_kind::static_column : column_kind::regular_column)
             .with_column("v", utf8_type)
             .build())
         , _v_def(*_s->get_column_definition(to_bytes("v")))
@@ -137,21 +138,33 @@ public:
     }
 
     mutation new_mutation(sstring pk) {
-        return mutation(make_pkey(pk), _s);
+        return mutation(_s, make_pkey(pk));
     }
 
     schema_ptr schema() {
         return _s;
     }
 
+    const schema_ptr schema() const {
+        return _s;
+    }
+
     // Creates a sequence of keys in ring order
     std::vector<dht::decorated_key> make_pkeys(int n) {
-        std::vector<dht::decorated_key> keys;
-        for (int i = 0; i < n; ++i) {
-            keys.push_back(make_pkey(i));
-        }
-        std::sort(keys.begin(), keys.end(), dht::decorated_key::less_comparator(_s));
-        return keys;
+        auto local_keys = make_local_keys(n, _s);
+        return boost::copy_range<std::vector<dht::decorated_key>>(local_keys | boost::adaptors::transformed([this] (sstring& key) {
+            return make_pkey(std::move(key));
+        }));
+    }
+
+    dht::decorated_key make_pkey() {
+        return make_pkey(make_local_key(_s));
+    }
+
+    static std::vector<dht::ring_position> to_ring_positions(const std::vector<dht::decorated_key>& keys) {
+        return boost::copy_range<std::vector<dht::ring_position>>(keys | boost::adaptors::transformed([] (const dht::decorated_key& key) {
+            return dht::ring_position(key);
+        }));
     }
 
     // Returns n clustering keys in their natural order

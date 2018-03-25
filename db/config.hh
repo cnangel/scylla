@@ -28,6 +28,7 @@
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/util/program-options.hh>
 #include <seastar/util/log.hh>
 
@@ -37,6 +38,8 @@
 namespace seastar { class file; struct logging_settings; }
 
 namespace db {
+
+class extensions;
 
 /*
  * This type is not use, and probably never will be.
@@ -57,6 +60,8 @@ struct seed_provider_type {
 class config : public utils::config_file {
 public:
     config();
+    config(std::shared_ptr<db::extensions>);
+    ~config();
 
     // Throws exception if experimental feature is disabled.
     void check_experimental(const sstring& what) const;
@@ -108,11 +113,17 @@ public:
      */
 
 #define _make_config_values(val)                \
-    val(background_writer_scheduling_quota, double, 1.0, Used, \
+    val(background_writer_scheduling_quota, double, 1.0, Unused, \
             "max cpu usage ratio (between 0 and 1) for compaction process. Not intended for setting in normal operations. Setting it to 1 or higher will disable it, recommended operational setting is 0.5." \
     )   \
-    val(auto_adjust_flush_quota, bool, false, Used, \
-            "true: auto-adjust quota for flush processes. false: put everyone together in the static background writer group - if background writer group is enabled. Not intended for setting in normal operations" \
+    val(auto_adjust_flush_quota, bool, false, Unused, \
+            "true: auto-adjust memtable shares for flush processes" \
+    )   \
+    val(memtable_flush_static_shares, float, 0, Used, \
+            "If set to higher than 0, ignore the controller's output and set the memtable shares statically. Do not set this unless you know what you are doing and suspect a problem in the controller. This option will be retired when the controller reaches more maturity" \
+    )   \
+    val(compaction_static_shares, float, 0, Used, \
+            "If set to higher than 0, ignore the controller's output and set the compaction shares statically. Do not set this unless you know what you are doing and suspect a problem in the controller. This option will be retired when the controller reaches more maturity" \
     )   \
     /* Initialization properties */             \
     /* The minimal properties needed for configuring a cluster. */  \
@@ -137,6 +148,9 @@ public:
     )                                           \
     val(data_file_directories, string_list, { "/var/lib/scylla/data" }, Used,   \
             "The directory location where table data (SSTables) is stored"   \
+    )                                           \
+    val(hints_directory, sstring, "/var/lib/scylla/hints", Used,   \
+            "The directory where hints files are stored if hinted handoff is enabled."   \
     )                                           \
     val(saved_caches_directory, sstring, "/var/lib/scylla/saved_caches", Unused, \
             "The directory location where table key and row caches are stored."  \
@@ -172,8 +186,9 @@ public:
             "\tSimpleSnitch: Use for single-data center deployments or single-zone in public clouds. Does not recognize data center or rack information. It treats strategy order as proximity, which can improve cache locality when disabling read repair.\n\n"    \
             "\tGossipingPropertyFileSnitch: Recommended for production. The rack and data center for the local node are defined in the cassandra-rackdc.properties file and propagated to other nodes via gossip. To allow migration from the PropertyFileSnitch, it uses the cassandra-topology.properties file if it is present.\n\n"    \
             /*"\tPropertyFileSnitch: Determines proximity by rack and data center, which are explicitly configured in the cassandra-topology.properties file.\n\n"    */\
-            /*"\tEc2Snitch: For EC2 deployments in a single region. Loads region and availability zone information from the EC2 API. The region is treated as the data center and the availability zone as the rack. Uses only private IPs. Subsequently it does not work across multiple regions.\n\n"    */\
-            /*"\tEc2MultiRegionSnitch: Uses public IPs as the broadcast_address to allow cross-region connectivity. This means you must also set seed addresses to the public IP and open the storage_port or ssl_storage_port on the public IP firewall. For intra-region traffic, Scylla switches to the private IP after establishing a connection.\n\n"    */\
+            "\tEc2Snitch: For EC2 deployments in a single region. Loads region and availability zone information from the EC2 API. The region is treated as the data center and the availability zone as the rack. Uses only private IPs. Subsequently it does not work across multiple regions.\n\n"    \
+            "\tEc2MultiRegionSnitch: Uses public IPs as the broadcast_address to allow cross-region connectivity. This means you must also set seed addresses to the public IP and open the storage_port or ssl_storage_port on the public IP firewall. For intra-region traffic, Scylla switches to the private IP after establishing a connection.\n\n"    \
+            "\tGoogleCloudSnitch: For deployments on Google Cloud Platform across one or more regions. The region is treated as a datacenter and the availability zone is treated as a rack within the datacenter. The communication should occur over private IPs within the same logical network.\n\n" \
             "\tRackInferringSnitch: Proximity is determined by rack and data center, which are assumed to correspond to the 3rd and 2nd octet of each node's IP address, respectively. This snitch is best used as an example for writing a custom snitch class (unless this happens to match your deployment conventions).\n" \
             "\n"    \
             "Related information: Snitches\n"    \
@@ -204,7 +219,7 @@ public:
             "Throttles compaction to the specified total throughput across the entire system. The faster you insert data, the faster you need to compact in order to keep the SSTable count down. The recommended Value is 16 to 32 times the rate of write throughput (in MBs/second). Setting the value to 0 disables compaction throttling.\n"  \
             "Related information: Configuring compaction"   \
     )                                                   \
-    val(compaction_large_partition_warning_threshold_mb, uint32_t, 100, Unused, \
+    val(compaction_large_partition_warning_threshold_mb, uint32_t, 1000, Used, \
             "Log a warning when compacting partitions larger than this value"   \
     )                                               \
     /* Common memtable settings */  \
@@ -560,17 +575,14 @@ public:
     val(dynamic_snitch_update_interval_in_ms, uint32_t, 100, Unused,     \
             "The time interval for how often the snitch calculates node scores. Because score calculation is CPU intensive, be careful when reducing this interval."  \
     )   \
-    val(hinted_handoff_enabled, bool, true, Unused,     \
-            "Enable or disable hinted handoff. To enable per data center, add data center list. For example: hinted_handoff_enabled: DC1,DC2. A hint indicates that the write needs to be replayed to an unavailable node. Where Cassandra writes the hint depends on the version:\n"  \
-            "\n"    \
-            "\tPrior to 1.0: Writes to a live replica node.\n"  \
-            "\t1.0 and later: Writes to the coordinator node.\n"  \
+    val(hinted_handoff_enabled, sstring, "false", Used,     \
+            "Experimental: enable or disable hinted handoff. To enable per data center, add data center list. For example: hinted_handoff_enabled: DC1,DC2. A hint indicates that the write needs to be replayed to an unavailable node. " \
             "Related information: About hinted handoff writes"  \
     )   \
     val(hinted_handoff_throttle_in_kb, uint32_t, 1024, Unused,     \
             "Maximum throttle per delivery thread in kilobytes per second. This rate reduces proportionally to the number of nodes in the cluster. For example, if there are two nodes in the cluster, each delivery thread will use the maximum rate. If there are three, each node will throttle to half of the maximum, since the two nodes are expected to deliver hints simultaneously."  \
     )   \
-    val(max_hint_window_in_ms, uint32_t, 10800000, Unused,     \
+    val(max_hint_window_in_ms, uint32_t, 10800000, Used,     \
             "Maximum amount of time that hints are generates hints for an unresponsive node. After this interval, new hints are no longer generated until the node is back up and responsive. If the node goes down again, a new interval begins. This setting can prevent a sudden demand for resources when a node is brought back online and the rest of the cluster attempts to replay a large volume of hinted writes.\n"  \
             "Related information: Failure detection and recovery"  \
     )   \
@@ -631,6 +643,11 @@ public:
             "Related information: Object permissions"   \
             , "org.apache.cassandra.auth.AllowAllAuthorizer" \
             , "org.apache.cassandra.auth.CassandraAuthorizer" \
+    )   \
+    val(role_manager, sstring, "org.apache.cassandra.auth.CassandraRoleManager", Used,    \
+            "The role-management backend, used to maintain grantts and memberships between roles.\n"    \
+            "The available role-managers are:\n"    \
+            "\tCassandraRoleManager : Stores role data in the system_auth keyspace."    \
     )   \
     val(permissions_validity_in_ms, uint32_t, 10000, Used,     \
             "How long permissions in cache remain valid. Depending on the authorizer, such as CassandraAuthorizer, fetching permissions can be resource intensive. Permissions caching is disabled when this property is set to 0 or when AllowAllAuthorizer is used. The cached value is considered valid as long as both its value is not older than the permissions_validity_in_ms " \
@@ -717,6 +734,7 @@ public:
     val(enable_keyspace_column_family_metrics, bool, false, Used, "Enable per keyspace and per column family metrics reporting") \
     val(enable_sstable_data_integrity_check, bool, false, Used, "Enable interposer which checks for integrity of every sstable write." \
         " Performance is affected to some extent as a result. Useful to help debugging problems that may arise at another layers.") \
+    val(cpu_scheduler, bool, true, Used, "Enable cpu scheduling") \
     /* done! */
 
 #define _make_value_member(name, type, deflt, status, desc, ...)    \
@@ -726,6 +744,10 @@ public:
 
     seastar::logging_settings logging_settings(const boost::program_options::variables_map&) const;
 
+    boost::program_options::options_description_easy_init&
+    add_options(boost::program_options::options_description_easy_init&);
+
+    const db::extensions& extensions() const;
 private:
     template<typename T>
     struct log_legacy_value : public named_value<T, value_status::Used> {
@@ -744,6 +766,8 @@ private:
     log_legacy_value<seastar::log_level> default_log_level;
     log_legacy_value<std::unordered_map<sstring, seastar::log_level>> logger_log_level;
     log_legacy_value<bool> log_to_stdout, log_to_syslog;
+
+    std::shared_ptr<db::extensions> _extensions;
 };
 
 }
